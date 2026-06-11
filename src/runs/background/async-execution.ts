@@ -24,6 +24,7 @@ import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
 import { resolveEffectiveAcceptance } from "../shared/acceptance.ts";
+import { loadConfig } from "../../extension/config.ts";
 import {
 	type AcceptanceInput,
 	type ArtifactConfig,
@@ -139,6 +140,7 @@ interface AsyncSingleParams {
 	output?: string | boolean;
 	outputMode?: "inline" | "file-only";
 	modelOverride?: string;
+	timeoutMs?: number;
 	availableModels?: AvailableModelInfo[];
 	maxSubagentDepth: number;
 	worktreeSetupHook?: string;
@@ -484,6 +486,7 @@ export function executeAsyncChain(
 				piArgv1: process.argv[1],
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
+				childTimeoutMs: loadConfig().childTimeoutMs,
 				controlConfig,
 				controlIntercomTarget,
 				childIntercomTargets,
@@ -696,6 +699,7 @@ export function executeAsyncSingle(
 						outputPath,
 						outputMode,
 						sessionFile,
+						timeoutMs: params.timeoutMs,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
 						effectiveAcceptance: resolveEffectiveAcceptance({
 							explicit: params.acceptance,
@@ -720,6 +724,7 @@ export function executeAsyncSingle(
 				piArgv1: process.argv[1],
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
+				childTimeoutMs: loadConfig().childTimeoutMs,
 				controlConfig,
 				controlIntercomTarget,
 				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,

@@ -45,6 +45,12 @@ import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import {
+	WALL_CLOCK_TIMEOUT_EXIT_CODE,
+	armWallClockTimeout,
+	wallClockTimeoutMessage,
+} from "../../shared/wall-clock-timeout.ts";
+import { loadConfig } from "../../extension/config.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -229,6 +235,7 @@ async function runSingleAttempt(
 	const spawnEnv = { ...process.env, ...sharedEnv, ...getSubagentDepthEnv(options.maxSubagentDepth) };
 	let observedMutationAttempt = false;
 
+	const wallClockTimeoutMs = options.timeoutMs ?? loadConfig().childTimeoutMs;
 	const exitCode = await new Promise<number>((resolve) => {
 		const spawnSpec = getPiSpawnCommand(args);
 		const proc = spawn(spawnSpec.command, spawnSpec.args, {
@@ -247,6 +254,14 @@ async function runSingleAttempt(
 		let removeAbortListener: (() => void) | undefined;
 		let removeInterruptListener: (() => void) | undefined;
 		let activityTimer: NodeJS.Timeout | undefined;
+
+		const wallClock = armWallClockTimeout(proc, wallClockTimeoutMs, {
+			isCancelled: () => settled || processClosed || detached,
+			onTimeout: () => {
+				result.timedOut = true;
+				result.error = result.error ?? wallClockTimeoutMessage(wallClockTimeoutMs ?? 0);
+			},
+		});
 
 		const detachForIntercom = () => {
 			detached = true;
@@ -313,6 +328,7 @@ async function runSingleAttempt(
 		const finish = (code: number) => {
 			if (settled) return;
 			settled = true;
+			wallClock.clear();
 			clearFinalDrainTimers();
 			clearStdioGuard();
 			if (activityTimer) {
@@ -584,6 +600,10 @@ async function runSingleAttempt(
 			processClosed = true;
 			if (buf.trim()) processLine(buf);
 			if (!result.error && assistantError) result.error = assistantError;
+			if (wallClock.timedOut()) {
+				finish(WALL_CLOCK_TIMEOUT_EXIT_CODE);
+				return;
+			}
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !result.error;
 			if (code !== 0 && stderrBuf.trim() && !result.error && !forcedDrainAfterFinalSuccess) {
 				result.error = stderrBuf.trim();

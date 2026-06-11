@@ -8,6 +8,8 @@ export interface RunnerSubagentStep {
 	cwd?: string;
 	model?: string;
 	thinking?: string;
+	/** Wall-clock timeout in ms for this step's child process; overrides config childTimeoutMs. */
+	timeoutMs?: number;
 	modelCandidates?: string[];
 	tools?: string[];
 	extensions?: string[];

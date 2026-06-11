@@ -390,6 +390,8 @@ export interface SingleResult {
 	exitCode: number;
 	detached?: boolean;
 	detachedReason?: string;
+	/** True when the child was killed by the wall-clock timeout (exit 124). */
+	timedOut?: boolean;
 	interrupted?: boolean;
 	messages?: Message[];
 	usage: Usage;
@@ -777,6 +779,8 @@ export interface RunSyncOptions {
 	nestedRoute?: NestedRouteInfo;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
+	/** Wall-clock timeout for this child run in ms; overrides config childTimeoutMs. Expiry kills the child and reports it failed (exit 124). */
+	timeoutMs?: number;
 	/** Registry models available for heuristic bare-model resolution */
 	availableModels?: Array<{ provider: string; id: string; fullId: string }>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
@@ -826,6 +830,8 @@ export interface ExtensionConfig {
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	intercomBridge?: IntercomBridgeConfig;
+	/** Default wall-clock timeout in ms for every child run (sync and async). Per-task timeoutMs overrides it; unset/0 disables. */
+	childTimeoutMs?: number;
 }
 
 // ============================================================================

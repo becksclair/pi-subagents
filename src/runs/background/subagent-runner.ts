@@ -50,6 +50,11 @@ import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelSt
 import { nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import {
+	WALL_CLOCK_TIMEOUT_EXIT_CODE,
+	armWallClockTimeout,
+	wallClockTimeoutMessage,
+} from "../../shared/wall-clock-timeout.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import {
@@ -98,6 +103,8 @@ interface SubagentRunConfig {
 	piArgv1?: string;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
+	/** Default wall-clock timeout in ms for child runs; per-step timeoutMs overrides. */
+	childTimeoutMs?: number;
 	controlConfig?: ResolvedControlConfig;
 	controlIntercomTarget?: string;
 	childIntercomTargets?: Array<string | undefined>;
@@ -233,6 +240,7 @@ function runPiStreaming(
 	childEventContext?: ChildEventContext,
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void,
 	onChildEvent?: (event: ChildEvent) => void,
+	wallClockTimeoutMs?: number,
 ): Promise<RunPiStreamingResult> {
 	return new Promise((resolve) => {
 		const outputStream = fs.createWriteStream(outputFile, { flags: "w" });
@@ -360,6 +368,12 @@ function runPiStreaming(
 		let finalHardKillTimer: NodeJS.Timeout | undefined;
 		let settled = false;
 		const clearStdioGuard = attachPostExitStdioGuard(child, { idleMs: 2000, hardMs: 8000 });
+		const wallClock = armWallClockTimeout(child, wallClockTimeoutMs, {
+			isCancelled: () => settled,
+			onTimeout: () => {
+				error = error ?? wallClockTimeoutMessage(wallClockTimeoutMs ?? 0);
+			},
+		});
 		child.stdout.on("data", (chunk: Buffer) => {
 			const text = chunk.toString();
 			stdoutBuf += text;
@@ -415,6 +429,7 @@ function runPiStreaming(
 		child.on("close", (exitCode, signal) => {
 			settled = true;
 			registerInterrupt?.(undefined);
+			wallClock.clear();
 			clearDrainTimers();
 			clearStdioGuard();
 			if (stdoutBuf.trim()) processStdoutLine(stdoutBuf);
@@ -425,7 +440,9 @@ function runPiStreaming(
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !finalError;
 			resolve({
 				stderr,
-				exitCode: interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
+				exitCode: wallClock.timedOut()
+					? WALL_CLOCK_TIMEOUT_EXIT_CODE
+					: interrupted || forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (exitCode ?? 1) : exitCode,
 				messages,
 				usage,
 				model,
@@ -439,6 +456,7 @@ function runPiStreaming(
 		child.on("error", (spawnError) => {
 			settled = true;
 			registerInterrupt?.(undefined);
+			wallClock.clear();
 			clearDrainTimers();
 			clearStdioGuard();
 			outputStream.end();
@@ -571,6 +589,7 @@ interface SingleStepContext {
 	outputFile: string;
 	piPackageRoot?: string;
 	piArgv1?: string;
+	childTimeoutMs?: number;
 	registerInterrupt?: (interrupt: (() => void) | undefined) => void;
 	childIntercomTarget?: string;
 	orchestratorIntercomTarget?: string;
@@ -687,6 +706,7 @@ async function runSingleStep(
 			{ eventsPath, runId: ctx.id, stepIndex: ctx.flatIndex, agent: step.agent },
 			ctx.registerInterrupt,
 			ctx.onChildEvent,
+			step.timeoutMs ?? ctx.childTimeoutMs,
 		);
 		cleanupTempDir(tempDir);
 
@@ -1591,6 +1611,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					flatIndex: fi, flatStepCount: Math.max(statusPayload.steps.length, 1),
 					outputFile: path.join(asyncDir, `output-${fi}.log`),
 					piPackageRoot: config.piPackageRoot,
+					childTimeoutMs: config.childTimeoutMs,
 					piArgv1: config.piArgv1,
 					childIntercomTarget: config.childIntercomTargets?.[fi],
 					orchestratorIntercomTarget: config.controlIntercomTarget,
@@ -1838,6 +1859,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							flatIndex: fi, flatStepCount: flatSteps.length,
 							outputFile: path.join(asyncDir, `output-${fi}.log`),
 							piPackageRoot: config.piPackageRoot,
+							childTimeoutMs: config.childTimeoutMs,
 							piArgv1: config.piArgv1,
 							childIntercomTarget: config.childIntercomTargets?.[fi],
 							orchestratorIntercomTarget: config.controlIntercomTarget,
@@ -2003,6 +2025,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				flatIndex, flatStepCount: flatSteps.length,
 				outputFile: path.join(asyncDir, `output-${flatIndex}.log`),
 				piPackageRoot: config.piPackageRoot,
+				childTimeoutMs: config.childTimeoutMs,
 				piArgv1: config.piArgv1,
 				childIntercomTarget: config.childIntercomTargets?.[flatIndex],
 				orchestratorIntercomTarget: config.controlIntercomTarget,

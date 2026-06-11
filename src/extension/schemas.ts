@@ -121,6 +121,7 @@ const TaskItem = Type.Object({
 	reads: Type.Optional(ReadsOverride),
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking for this task" })),
 	model: Type.Optional(Type.String({ description: "Override model for this task (e.g. 'google/gemini-3-pro')" })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, description: "Wall-clock timeout in ms for this task's child run; overrides config childTimeoutMs. On expiry the child is killed and reported failed (exit 124)." })),
 	skill: Type.Optional(SkillOverride),
 	acceptance: Type.Optional(AcceptanceOverride),
 });
@@ -141,6 +142,7 @@ const ParallelTaskSchema = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this task" })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, description: "Wall-clock timeout in ms for this task's child run; overrides config childTimeoutMs (exit 124 on expiry)." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 });
 
@@ -168,6 +170,7 @@ const DynamicParallelTemplateSchema = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this task" })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, description: "Wall-clock timeout in ms for this task's child run; overrides config childTimeoutMs (exit 124 on expiry)." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 }, { additionalProperties: false });
 
@@ -193,6 +196,7 @@ const ChainItem = Type.Object({
 	progress: Type.Optional(Type.Boolean({ description: "Enable progress.md tracking in {chain_dir}" })),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for this step" })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, description: "Wall-clock timeout in ms for this step's child run; overrides config childTimeoutMs (exit 124 on expiry)." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 	parallel: Type.Optional(Type.Unsafe({
 		anyOf: [
@@ -300,5 +304,6 @@ export const SubagentParams = Type.Object({
 	outputMode: Type.Optional(OutputModeOverride),
 	skill: Type.Optional(SkillOverride),
 	model: Type.Optional(Type.String({ description: "Override model for single agent (e.g. 'anthropic/claude-sonnet-4')" })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1000, description: "Wall-clock timeout in ms for the child run; overrides config childTimeoutMs. On expiry the child is killed and reported failed (exit 124)." })),
 	acceptance: Type.Optional(AcceptanceOverride),
 });
