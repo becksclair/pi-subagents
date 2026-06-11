@@ -552,7 +552,7 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	return filePath;
 }
 
-function listFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {
+function listFilesRecursive(dir: string, predicate: (fileName: string) => boolean, options: { recursive?: boolean } = {}): string[] {
 	const files: string[] = [];
 	if (!fs.existsSync(dir)) return files;
 
@@ -566,7 +566,9 @@ function listFilesRecursive(dir: string, predicate: (fileName: string) => boolea
 	for (const entry of entries) {
 		const filePath = path.join(dir, entry.name);
 		if (entry.isDirectory()) {
-			files.push(...listFilesRecursive(filePath, predicate));
+			if (options.recursive !== false) {
+				files.push(...listFilesRecursive(filePath, predicate, options));
+			}
 			continue;
 		}
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
@@ -576,10 +578,10 @@ function listFilesRecursive(dir: string, predicate: (fileName: string) => boolea
 	return files;
 }
 
-function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
+function loadAgentsFromDir(dir: string, source: AgentSource, options: { recursive?: boolean } = {}): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
-	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
+	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"), options)) {
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
@@ -786,7 +788,10 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	);
 
 	const userAgentsOld = scope === "project" ? [] : loadAgentsFromDir(userDirOld, "user");
-	const userAgentsNew = scope === "project" ? [] : loadAgentsFromDir(userDirNew, "user");
+	// ~/.agents is scanned flat: it commonly hosts other harnesses' trees
+	// (claude/, opencode/, skills/) whose .md frontmatter would otherwise be
+	// ingested as pi agents and shadow builtins with incompatible tool names.
+	const userAgentsNew = scope === "project" ? [] : loadAgentsFromDir(userDirNew, "user", { recursive: false });
 	const userAgents = [...userAgentsOld, ...userAgentsNew];
 
 	const projectAgents = scope === "user" ? [] : projectAgentDirs.flatMap((dir) => loadAgentsFromDir(dir, "project"));
@@ -828,7 +833,7 @@ export function discoverAgentsAll(cwd: string): {
 	);
 	const user = [
 		...loadAgentsFromDir(userDirOld, "user"),
-		...loadAgentsFromDir(userDirNew, "user"),
+		...loadAgentsFromDir(userDirNew, "user", { recursive: false }),
 	];
 	const projectMap = new Map<string, AgentConfig>();
 	for (const dir of projectDirs) {
