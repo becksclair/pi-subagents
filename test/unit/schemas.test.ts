@@ -250,6 +250,13 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 				if (Object.hasOwn(node, "anyOf") && Object.hasOwn(node, "type")) {
 					rejectedPaths.push(`${current.path}.type+anyOf`);
 				}
+				// Conditional schema composition is rejected by strict tool-schema
+				// validators; pairing invariants belong in runtime validation.
+				for (const keyword of ["allOf", "if", "then", "else", "not"]) {
+					if (Object.hasOwn(node, keyword)) {
+						rejectedPaths.push(`${current.path}.${keyword}`);
+					}
+				}
 
 				if (Array.isArray(current.value)) {
 					current.value.forEach((value, index) => stack.push({ path: `${current.path}[${index}]`, value }));
@@ -366,8 +373,10 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ chain: [{ parallel: [{ agent: "reviewer", skill: 123 }] }] },
 			{ chain: [{ agent: "reviewer", outputSchema: "schema.json" }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", outputSchema: "schema.json" }] }] },
-			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: [{ agent: "reviewer" }], collect: { as: "reviews" } }] },
-			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer" } }] },
+			// expand/parallel/collect PAIRING violations (array parallel with expand,
+			// expand without collect) are intentionally schema-valid: conditional
+			// keywords are provider-hostile, so validateChainOutputBindings rejects
+			// them at runtime instead (covered below).
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4, expression: "items" }, parallel: { agent: "reviewer" }, collect: { as: "reviews" } }] },
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer", as: "child" }, collect: { as: "reviews" } }] },
 			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer" }, collect: { as: "reviews" }, when: "later" }] },
@@ -387,6 +396,36 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		}
 		for (const value of invalidValues) {
 			assert.equal(validator.Check(value), false, `${JSON.stringify(value)} should not validate`);
+		}
+	});
+
+	it("rejects malformed dynamic fanout pairings at runtime", async () => {
+		const { validateChainOutputBindings, ChainOutputValidationError } = await import(
+			"../../src/runs/shared/chain-outputs.ts"
+		);
+		const validate = (steps: unknown) =>
+			validateChainOutputBindings(steps as Parameters<typeof validateChainOutputBindings>[0], { maxItems: 10 });
+
+		const producer = { agent: "planner", task: "plan targets", as: "targets", outputSchema: { type: "object" } };
+		const expand = { from: { output: "targets", path: "/items" }, maxItems: 4 };
+
+		// Well-formed dynamic step after a producing step passes.
+		assert.doesNotThrow(() =>
+			validate([producer, { expand, parallel: { agent: "reviewer", task: "Review {item}" }, collect: { as: "reviews" } }]),
+		);
+
+		// The pairing violations the tool schema deliberately no longer encodes.
+		const malformed = [
+			[producer, { expand, parallel: [{ agent: "reviewer" }], collect: { as: "reviews" } }],
+			[producer, { expand, parallel: { agent: "reviewer" } }],
+			[producer, { parallel: { agent: "reviewer" }, collect: { as: "reviews" } }],
+		];
+		for (const steps of malformed) {
+			assert.throws(
+				() => validate(steps),
+				ChainOutputValidationError,
+				`${JSON.stringify(steps[1])} should be rejected at runtime`,
+			);
 		}
 	});
 });
