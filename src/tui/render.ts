@@ -8,6 +8,7 @@ import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-codi
 import { Container, Markdown, Spacer, Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import {
 	type AgentProgress,
+	type ProgressSummary,
 	type AsyncJobState,
 	type AsyncJobStep,
 	type AsyncParallelGroupStatus,
@@ -240,7 +241,7 @@ function resultGlyph(result: Details["results"][number], output: string, theme: 
 	return theme.fg("success", "✓");
 }
 
-function compactCurrentActivity(progress: AgentProgress): string {
+function compactCurrentActivity(progress: AgentProgress | ProgressSummary): string {
 	const snapshotNow = snapshotNowForProgress(progress);
 	return formatCurrentToolLine(progress, getTermWidth() - 4, false, snapshotNow) ?? buildLiveStatusLine(progress, snapshotNow) ?? "thinking…";
 }

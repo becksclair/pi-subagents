@@ -39,12 +39,16 @@ import {
 	detectSubagentError,
 	extractToolArgsPreview,
 	extractTextFromContent,
+	boundStreamedRecentTools,
+	boundStreamedRecentOutput,
+	boundStreamedToolCalls,
 } from "../../shared/utils.ts";
 import { buildSkillInjection, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
 	WALL_CLOCK_TIMEOUT_EXIT_CODE,
 	armWallClockTimeout,
@@ -53,7 +57,7 @@ import {
 import { loadConfig } from "../../extension/config.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
-import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
+import { captureSingleOutputSnapshot, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
 	formatModelAttemptNote,
@@ -111,8 +115,8 @@ function snapshotProgress(progress: AgentProgress): AgentProgress {
 	return {
 		...progress,
 		skills: progress.skills ? [...progress.skills] : undefined,
-		recentTools: progress.recentTools.map((tool) => ({ ...tool })),
-		recentOutput: [...progress.recentOutput],
+		recentTools: boundStreamedRecentTools(progress.recentTools),
+		recentOutput: boundStreamedRecentOutput(progress.recentOutput),
 	};
 }
 
@@ -136,6 +140,15 @@ function snapshotResult(result: SingleResult, progress: AgentProgress): SingleRe
 		truncation: result.truncation ? { ...result.truncation } : undefined,
 		outputReference: result.outputReference ? { ...result.outputReference } : undefined,
 	};
+}
+
+function snapshotStreamResult(result: SingleResult, progress: AgentProgress): SingleResult {
+	const snapshot = snapshotResult(result, progress);
+	// Progress events are transport payloads, not the durable result. Avoid
+	// copying the whole child transcript into every tool update.
+	snapshot.messages = undefined;
+	snapshot.toolCalls = boundStreamedToolCalls(result);
+	return snapshot;
 }
 
 async function runSingleAttempt(
@@ -245,7 +258,6 @@ async function runSingleAttempt(
 			windowsHide: true,
 		});
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
-		let buf = "";
 		let processClosed = false;
 		let settled = false;
 		let detached = false;
@@ -254,6 +266,7 @@ async function runSingleAttempt(
 		let removeAbortListener: (() => void) | undefined;
 		let removeInterruptListener: (() => void) | undefined;
 		let activityTimer: NodeJS.Timeout | undefined;
+		let protocolHardKillTimer: NodeJS.Timeout | undefined;
 
 		const wallClock = armWallClockTimeout(proc, wallClockTimeoutMs, {
 			isCancelled: () => settled || processClosed || detached,
@@ -331,6 +344,10 @@ async function runSingleAttempt(
 			wallClock.clear();
 			clearFinalDrainTimers();
 			clearStdioGuard();
+			if (protocolHardKillTimer) {
+				clearTimeout(protocolHardKillTimer);
+				protocolHardKillTimer = undefined;
+			}
 			if (activityTimer) {
 				clearInterval(activityTimer);
 				activityTimer = undefined;
@@ -428,7 +445,7 @@ async function runSingleAttempt(
 		const emitUpdateSnapshot = (text: string) => {
 			if (!options.onUpdate || processClosed) return;
 			const progressSnapshot = snapshotProgress(progress);
-			const resultSnapshot = snapshotResult(result, progressSnapshot);
+			const resultSnapshot = snapshotStreamResult(result, progressSnapshot);
 			const controlEvents = drainPendingControlEvents();
 			options.onUpdate({
 				content: [{ type: "text", text }],
@@ -570,18 +587,25 @@ async function runSingleAttempt(
 			activityTimer.unref?.();
 		}
 
-		let stderrBuf = "";
+		const stderrTail = createBoundedByteTail();
+		const failProtocol = (limit: Parameters<typeof formatProtocolOutputLimit>[0]) => {
+			if (result.error?.startsWith("protocol_output_limit:")) return;
+			result.error = formatProtocolOutputLimit(limit);
+			progress.status = "failed";
+			progress.error = result.error;
+			if (!childExited) {
+				trySignalChild(proc, "SIGTERM");
+				protocolHardKillTimer = setTimeout(() => {
+					if (!settled && !processClosed && !detached) trySignalChild(proc, "SIGKILL");
+				}, 3000);
+				protocolHardKillTimer.unref?.();
+			}
+		};
+		const stdoutReader = createBoundedLineReader({ onLine: processLine, onLimit: failProtocol });
 
 		const clearStdioGuard = attachPostExitStdioGuard(proc, { idleMs: 2000, hardMs: 8000 });
-		proc.stdout.on("data", (d) => {
-			buf += d.toString();
-			const lines = buf.split("\n");
-			buf = lines.pop() || "";
-			lines.forEach(processLine);
-		});
-		proc.stderr.on("data", (d) => {
-			stderrBuf += d.toString();
-		});
+		proc.stdout.on("data", (chunk: Buffer) => stdoutReader.push(chunk));
+		proc.stderr.on("data", (chunk: Buffer) => stderrTail.push(chunk));
 		proc.on("exit", () => {
 			childExited = true;
 			clearFinalDrainTimers();
@@ -598,15 +622,16 @@ async function runSingleAttempt(
 				return;
 			}
 			processClosed = true;
-			if (buf.trim()) processLine(buf);
+			stdoutReader.end();
 			if (!result.error && assistantError) result.error = assistantError;
 			if (wallClock.timedOut()) {
 				finish(WALL_CLOCK_TIMEOUT_EXIT_CODE);
 				return;
 			}
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !result.error;
-			if (code !== 0 && stderrBuf.trim() && !result.error && !forcedDrainAfterFinalSuccess) {
-				result.error = stderrBuf.trim();
+			const stderrText = stderrTail.text().trim();
+			if (code !== 0 && stderrText && !result.error && !forcedDrainAfterFinalSuccess) {
+				result.error = stderrText;
 			}
 			const finalCode = forcedDrainAfterFinalSuccess ? 0 : forcedTerminationSignal || signal ? (code ?? 1) : (code ?? 0);
 			finish(finalCode);
@@ -614,6 +639,7 @@ async function runSingleAttempt(
 		proc.on("error", (error) => {
 			clearFinalDrainTimers();
 			clearStdioGuard();
+			stdoutReader.end();
 			void jsonlWriter.close().catch(() => {
 				// JSONL artifact flush is best effort.
 			});
@@ -698,6 +724,12 @@ async function runSingleAttempt(
 				: `${errInfo.errorType} failed with exit code ${errInfo.exitCode}`;
 		}
 	}
+	if (result.exitCode === 0 && !result.error && !options.structuredOutput && !options.outputPath) {
+		if (!getFinalOutput(result.messages).trim()) {
+			result.exitCode = 1;
+			result.error = "Subagent produced no output (possible model cold-start or empty response).";
+		}
+	}
 	if (options.structuredOutput && result.exitCode === 0 && !result.error) {
 		const structured = readStructuredOutput({
 			schema: options.structuredOutput.schema,
@@ -775,7 +807,7 @@ async function runSingleAttempt(
 	if (options.onUpdate) {
 		const finalText = result.finalOutput || result.error || "(no output)";
 		const progressSnapshot = snapshotProgress(progress);
-		const resultSnapshot = snapshotResult(result, progressSnapshot);
+		const resultSnapshot = snapshotStreamResult(result, progressSnapshot);
 		options.onUpdate({
 			content: [{ type: "text", text: finalText }],
 			details: {
@@ -854,6 +886,7 @@ export async function runSync(
 		const skillInjection = buildSkillInjection(resolvedSkills);
 		systemPrompt = systemPrompt ? `${systemPrompt}\n\n${skillInjection}` : skillInjection;
 	}
+	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, options.outputPath);
 
 	const candidates = buildModelCandidates(
 		options.modelOverride ?? agent.model,

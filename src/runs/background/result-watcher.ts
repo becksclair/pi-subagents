@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
+import { buildCompletionKey, hasSeenWithTtl, markSeenWithTtl } from "./completion-dedupe.ts";
 import { createFileCoalescer } from "../../shared/file-coalescer.ts";
 import {
 	SUBAGENT_ASYNC_COMPLETE_EVENT,
@@ -104,14 +104,24 @@ export function createResultWatcher(
 } {
 	const fsApi = deps.fs ?? fs;
 	const timers = deps.timers ?? { setTimeout, clearTimeout, setInterval, clearInterval };
+	const processing = new Set<string>();
+	let deliveryActive = true;
+	let deliveryEpoch = 0;
+
+	const ownsSession = (sessionId: string, epoch: number): boolean =>
+		deliveryActive && epoch === deliveryEpoch && state.currentSessionId === sessionId;
 
 	const handleResult = async (file: string) => {
 		const resultPath = path.join(resultsDir, file);
-		if (!fsApi.existsSync(resultPath)) return;
+		const handleEpoch = deliveryEpoch;
+		if (!deliveryActive || !fsApi.existsSync(resultPath)) return;
+		let completionKey: string | undefined;
 		try {
 			const data = JSON.parse(fsApi.readFileSync(resultPath, "utf-8")) as ResultFileData;
-			if (data.sessionId && data.sessionId !== state.currentSessionId) return;
-			if (!data.sessionId && data.cwd && (!state.baseCwd || data.cwd !== state.baseCwd)) return;
+			// Async result roots are shared across Pi sessions. Deliver only to the
+			// exact owning session; cwd matching is not sufficient when two sessions
+			// are open in the same repository.
+			if (typeof data.sessionId !== "string" || !ownsSession(data.sessionId, handleEpoch)) return;
 
 			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
 			const hasExplicitNestedChildren = data.nestedChildren !== undefined;
@@ -125,11 +135,13 @@ export function createResultWatcher(
 				}
 			}
 			const now = Date.now();
-			const completionKey = buildCompletionKey(data, `result:${file}`);
-			if (markSeenWithTtl(state.completionSeen, completionKey, now, completionTtlMs)) {
+			completionKey = buildCompletionKey(data, `result:${file}`);
+			if (hasSeenWithTtl(state.completionSeen, completionKey, now, completionTtlMs)) {
 				fsApi.unlinkSync(resultPath);
 				return;
 			}
+			if (processing.has(completionKey)) return;
+			processing.add(completionKey);
 
 			const hasResultChildren = Array.isArray(data.results) && data.results.length > 0;
 			const resultChildren = hasResultChildren
@@ -164,6 +176,7 @@ export function createResultWatcher(
 			}), nestedChildren);
 
 			const intercomTarget = data.intercomTarget?.trim();
+			if (!ownsSession(data.sessionId, handleEpoch)) return;
 			if (intercomTarget) {
 				const mode = data.mode === "single" || data.mode === "parallel" || data.mode === "chain"
 					? data.mode
@@ -178,11 +191,13 @@ export function createResultWatcher(
 					asyncDir: data.asyncDir,
 				});
 				const delivered = await deliverSubagentResultIntercomEvent(pi.events, payload);
+				if (!ownsSession(data.sessionId, handleEpoch)) return;
 				if (!delivered) {
 					console.error(`Subagent async grouped result intercom delivery was not acknowledged for '${resultPath}'.`);
 				}
 			}
 
+			if (!ownsSession(data.sessionId, handleEpoch)) return;
 			pi.events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 				...data,
 				runId,
@@ -202,10 +217,14 @@ export function createResultWatcher(
 						: [],
 				} : {}),
 			});
+			if (!ownsSession(data.sessionId, handleEpoch)) return;
+			markSeenWithTtl(state.completionSeen, completionKey, Date.now(), completionTtlMs);
 			fsApi.unlinkSync(resultPath);
 		} catch (error) {
 			if (isNotFoundError(error)) return;
 			console.error(`Failed to process subagent result file '${resultPath}':`, error);
+		} finally {
+			if (completionKey) processing.delete(completionKey);
 		}
 	};
 
@@ -257,6 +276,7 @@ export function createResultWatcher(
 	};
 
 	const startResultWatcher = () => {
+		deliveryActive = true;
 		if (state.watcher) return;
 		if (state.watcherRestartTimer) {
 			timers.clearTimeout(state.watcherRestartTimer);
@@ -293,6 +313,8 @@ export function createResultWatcher(
 	};
 
 	const stopResultWatcher = () => {
+		deliveryActive = false;
+		deliveryEpoch += 1;
 		state.watcher?.close();
 		state.watcher = null;
 		if (state.watcherRestartTimer) {

@@ -17,6 +17,25 @@ afterEach(() => {
 	}
 });
 
+describe("agent discovery boundaries", () => {
+	it("does not parse legacy .agents skill files as agent definitions", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-skill-boundary-"));
+		tempDirs.push(dir);
+		const skillDir = path.join(dir, ".agents", "skills", "fake-agent");
+		fs.mkdirSync(skillDir, { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), `---
+name: fake-agent
+description: This is a skill, not an agent
+---
+
+Skill instructions
+`, "utf-8");
+
+		const result = discoverAgents(dir, "project");
+		assert.equal(result.agents.some((agent) => agent.name === "fake-agent"), false);
+	});
+});
+
 describe("agent frontmatter defaultContext", () => {
 	it("serializes defaultContext into agent frontmatter", () => {
 		const agent: AgentConfig = {

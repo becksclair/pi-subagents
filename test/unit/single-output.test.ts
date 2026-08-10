@@ -7,6 +7,7 @@ import {
 	captureSingleOutputSnapshot,
 	finalizeSingleOutput,
 	formatSavedOutputReference,
+	injectOutputPathSystemPrompt,
 	injectSingleOutputInstruction,
 	normalizeSingleOutputOverride,
 	resolveSingleOutput,
@@ -73,10 +74,18 @@ describe("resolveSingleOutputPath", () => {
 	});
 });
 
-describe("injectSingleOutputInstruction", () => {
-	it("appends output instruction with resolved path", () => {
+describe("output path instructions", () => {
+	it("appends an authoritative output instruction to the task", () => {
 		const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md");
 		assert.match(output, /Write your findings to: \/tmp\/report.md/);
+		assert.match(output, /This path is authoritative for this run/);
+	});
+
+	it("also reinforces the runtime output override in the system prompt", () => {
+		const prompt = injectOutputPathSystemPrompt("Base prompt says write old.md", "/tmp/report.md");
+		assert.match(prompt, /Runtime output path override/);
+		assert.match(prompt, /Write your findings to: \/tmp\/report.md/);
+		assert.match(prompt, /Ignore any other output filename or output path/);
 	});
 });
 

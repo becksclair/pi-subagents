@@ -329,10 +329,12 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(callFile, "expected a recorded mock pi call");
 		const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
 		const taskArg = args.at(-1) ?? "";
+		const progressPath = path.join(ASYNC_DIR, asyncId, "progress", "progress.md");
 		assert.ok(taskArg.includes(`[Read from: ${path.join(tempDir, "input.md")}]`));
-		assert.ok(taskArg.includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
+		assert.ok(taskArg.includes(`Update progress at: ${progressPath}`));
 		assert.ok(taskArg.includes(`Write your findings to: ${outputPath}`));
-		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), false);
+		assert.equal(fs.existsSync(progressPath), true);
 	});
 
 	it("async single rejects explicit reviewed acceptance without a reviewer result", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -753,6 +755,35 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		}
 	});
 
+	it("readStatus invalidates cache across atomic replacement even when mtime is preserved", () => {
+		const dir = createTempDir();
+		try {
+			const statusPath = path.join(dir, "status.json");
+			fs.writeFileSync(statusPath, JSON.stringify({
+				runId: "atomic-cache-test",
+				state: "running",
+				mode: "single",
+				startedAt: 1,
+			}));
+			const initialStat = fs.statSync(statusPath);
+			assert.equal(readStatus(dir)?.state, "running");
+
+			const replacement = path.join(dir, "status.next.json");
+			fs.writeFileSync(replacement, JSON.stringify({
+				runId: "atomic-cache-test",
+				state: "complete",
+				mode: "single",
+				startedAt: 1,
+			}));
+			fs.utimesSync(replacement, initialStat.atime, initialStat.mtime);
+			fs.renameSync(replacement, statusPath);
+
+			assert.equal(readStatus(dir)?.state, "complete");
+		} finally {
+			removeTempDir(dir);
+		}
+	});
+
 	it("readStatus throws for malformed status files", () => {
 		const dir = createTempDir();
 		try {
@@ -761,6 +792,41 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally {
 			removeTempDir(dir);
 		}
+	});
+
+	it("background children inherit the parent session model when unconfigured", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "Inherited parent model" });
+		const id = `async-parent-model-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Use the live parent model",
+			agentConfig: makeAgent("worker"),
+			ctx: {
+				pi: { events: { emit() {} } },
+				cwd: tempDir,
+				currentSessionId: "session-1",
+				currentModelProvider: "openai-codex",
+				currentModel: { provider: "openai-codex", id: "gpt-5.6-luna" },
+			},
+			availableModels: [{ provider: "openai-codex", id: "gpt-5.6-luna", fullId: "openai-codex/gpt-5.6-luna" }],
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+		});
+
+		await waitForAsyncResultFile(id, 10_000);
+		const args = readLastMockPiArgs(mockPi);
+		const modelIndex = args.indexOf("--model");
+		assert.notEqual(modelIndex, -1);
+		assert.equal(args[modelIndex + 1], "openai-codex/gpt-5.6-luna");
 	});
 
 	it("background runs record fallback attempts and final model", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -828,6 +894,49 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(statusPayload.totalTokens!.total > 0);
 		assert.ok(statusPayload.steps[0]?.tokens!.total > 0);
 		assert.match(fs.readFileSync(path.join(asyncDir, "output-0.log"), "utf-8"), /Recovered asynchronously/);
+		assert.equal(mockPi.callCount(), 2);
+	});
+
+	it("background runs retry a fallback after an empty child response", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "" });
+		mockPi.onCall({ output: "Recovered asynchronously after empty response" });
+		const id = `async-empty-fallback-${Date.now().toString(36)}`;
+		const resultPath = path.join(RESULTS_DIR, `${id}.json`);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", {
+				model: "openai/gpt-5-mini",
+				fallbackModels: ["anthropic/claude-sonnet-4"],
+			}),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			availableModels: [
+				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
+				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
+			],
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(resultPath)) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.match(payload.results[0]?.output ?? "", /^\[fallback\].*produced no output[\s\S]*Recovered asynchronously after empty response$/);
+		assert.match(payload.results[0]?.modelAttempts?.[0]?.error ?? "", /produced no output/);
 		assert.equal(mockPi.callCount(), 2);
 	});
 
@@ -1822,6 +1931,61 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		while (!fs.existsSync(resultPath)) {
 			if (Date.now() > doneDeadline) assert.fail(`Timed out waiting for async result file: ${resultPath}`);
 			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+	});
+
+	it("bounds background diagnostic event logs and drops noisy message updates", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const previousMaxBytes = process.env.PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES;
+		process.env.PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES = "900";
+		try {
+			mockPi.onCall({
+				steps: [{
+					jsonl: [
+						{
+							type: "message_update",
+							assistantMessageEvent: { type: "thinking_delta", delta: "NOISY_PARTIAL_DELTA" },
+							message: { role: "assistant", content: [{ type: "text", text: "NOISY_PARTIAL_MESSAGE".repeat(200) }] },
+						},
+						events.toolStart("bash", { command: `echo ${"BIG_COMMAND_PAYLOAD".repeat(200)}` }),
+						events.assistantMessage("Done after noisy stream"),
+					],
+				}],
+			});
+
+			const id = `async-noisy-events-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, id);
+			const result = executeAsyncSingle(id, {
+				agent: "echo",
+				task: "Inspect noisy diagnostics without edits",
+				agentConfig: makeAgent("echo"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+			});
+			assert.equal(result.isError, undefined);
+
+			const resultPath = await waitForAsyncResultFile(id, 10_000);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true);
+			assert.equal(payload.results[0]?.output, "Done after noisy stream");
+
+			const eventsText = fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8");
+			assert.doesNotMatch(eventsText, /"type":"message_update"/);
+			assert.doesNotMatch(eventsText, /NOISY_PARTIAL_/);
+			assert.doesNotMatch(eventsText, /BIG_COMMAND_PAYLOAD/);
+			assert.match(eventsText, /"type":"subagent\.events\.truncated"/);
+		} finally {
+			if (previousMaxBytes === undefined) delete process.env.PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES;
+			else process.env.PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES = previousMaxBytes;
 		}
 	});
 

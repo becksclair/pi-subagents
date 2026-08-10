@@ -3,6 +3,13 @@ import type { Usage } from "../../shared/types.ts";
 
 export type { AvailableModelInfo };
 
+export const INHERIT_MODEL = "inherit";
+
+export interface ParentModel {
+	provider: string;
+	id: string;
+}
+
 interface ModelAttemptSummary {
 	model: string;
 	success: boolean;
@@ -18,6 +25,20 @@ export function splitThinkingSuffix(model: string): { baseModel: string; thinkin
 		baseModel: model.substring(0, colonIdx),
 		thinkingSuffix: model.substring(colonIdx),
 	};
+}
+
+export function resolveSubagentModelOverride(
+	requestedModel: string | boolean | undefined,
+	parentModel: ParentModel | undefined,
+	availableModels: AvailableModelInfo[] | undefined,
+	preferredProvider?: string,
+): string | undefined {
+	const trimmed = typeof requestedModel === "string" ? requestedModel.trim() : "";
+	const explicit = trimmed && trimmed !== INHERIT_MODEL ? trimmed : undefined;
+	if (explicit === undefined) {
+		return parentModel ? `${parentModel.provider}/${parentModel.id}` : undefined;
+	}
+	return resolveModelCandidate(explicit, availableModels, preferredProvider);
 }
 
 export function resolveModelCandidate(
@@ -82,6 +103,10 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/fetch failed/i,
 	/network error/i,
 	/socket hang up/i,
+	/cold[- ]?start/i,
+	/empty response/i,
+	/no output/i,
+	/model.*(?:load|fail|error)/i,
 	/upstream/i,
 	/timed? out/i,
 	/timeout/i,
@@ -96,7 +121,7 @@ export function isRetryableModelFailure(error: string | undefined): boolean {
 }
 
 export function formatModelAttemptNote(attempt: ModelAttemptSummary, nextModel?: string): string {
-	const failure = attempt.error?.trim() || `exit ${attempt.exitCode ?? 1}`;
+	const failure = (attempt.error?.trim() || `exit ${attempt.exitCode ?? 1}`).replace(/[.!?]+$/, "");
 	return nextModel
 		? `[fallback] ${attempt.model} failed: ${failure}. Retrying with ${nextModel}.`
 		: `[fallback] ${attempt.model} failed: ${failure}.`;

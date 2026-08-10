@@ -59,7 +59,7 @@ import {
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import { resolveModelCandidate } from "../shared/model-fallback.ts";
+import { resolveSubagentModelOverride } from "../shared/model-fallback.ts";
 import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, outputEntryFromResult, resolveOutputReferences, validateChainOutputBindings } from "../shared/chain-outputs.ts";
@@ -115,6 +115,7 @@ interface ParallelChainRunInput {
 		updatedAt: number;
 		currentAgent?: string;
 		currentIndex?: number;
+		activeChildren?: number;
 		currentActivityState?: ActivityState;
 		lastActivityAt?: number;
 		currentTool?: string;
@@ -199,6 +200,15 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 	const failFast = input.step.failFast ?? false;
 	let aborted = false;
 
+	// The fork resolver is cached, but creating distinct branches still touches
+	// one parent session. Prewarm every static/materialized parallel child before
+	// mapConcurrent so session branching never races inside the fan-out.
+	if (input.sessionFileForIndex) {
+		for (let taskIndex = 0; taskIndex < input.step.parallel.length; taskIndex++) {
+			input.sessionFileForIndex(input.globalTaskIndex + taskIndex);
+		}
+	}
+
 	const parallelResults = await mapConcurrent(
 		input.step.parallel,
 		concurrency,
@@ -232,9 +242,12 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			taskStr = prefix + taskStr + suffix;
 
 			const taskAgentConfig = input.agents.find((agent) => agent.name === task.agent);
-			const effectiveModel =
-				(task.model ? resolveModelCandidate(task.model, input.availableModels, input.ctx.model?.provider) : null)
-				?? resolveModelCandidate(taskAgentConfig?.model, input.availableModels, input.ctx.model?.provider);
+			const effectiveModel = resolveSubagentModelOverride(
+				task.model ?? taskAgentConfig?.model,
+				input.ctx.model,
+				input.availableModels,
+				input.ctx.model?.provider,
+			);
 			const maxSubagentDepth = resolveChildMaxSubagentDepth(input.maxSubagentDepth, taskAgentConfig?.maxSubagentDepth);
 
 			const taskCwd = input.worktreeSetup
@@ -376,6 +389,7 @@ interface ChainExecutionParams {
 		updatedAt: number;
 		currentAgent?: string;
 		currentIndex?: number;
+		activeChildren?: number;
 		currentActivityState?: ActivityState;
 		lastActivityAt?: number;
 		currentTool?: string;
@@ -629,6 +643,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				}
 				progressCreated = ensureParallelProgressFile(chainDir, progressCreated, parallelBehaviors);
 				createParallelDirs(chainDir, stepIndex, step.parallel.length, agentNames);
+				if (foregroundControl) foregroundControl.activeChildren = Math.max(1, step.parallel.length);
 
 				const parallelResults = await runParallelChainTasks({
 					step,
@@ -836,6 +851,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 
 			progressCreated = ensureParallelProgressFile(chainDir, progressCreated, parallelBehaviors);
 			createParallelDirs(chainDir, stepIndex, dynamicParallelStep.parallel.length, dynamicParallelStep.parallel.map((task) => task.agent));
+			if (foregroundControl) foregroundControl.activeChildren = Math.max(1, dynamicParallelStep.parallel.length);
 			const parallelResults = await runParallelChainTasks({
 				step: dynamicParallelStep,
 				parallelTemplates,
@@ -1017,10 +1033,12 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const cleanTask = stepTask;
 			stepTask = prefix + stepTask + suffix;
 
-			const effectiveModel =
-				tuiOverride?.model
-				?? (seqStep.model ? resolveModelCandidate(seqStep.model, availableModels, ctx.model?.provider) : null)
-				?? resolveModelCandidate(agentConfig.model, availableModels, ctx.model?.provider);
+			const effectiveModel = resolveSubagentModelOverride(
+				tuiOverride?.model ?? seqStep.model ?? agentConfig.model,
+				ctx.model,
+				availableModels,
+				ctx.model?.provider,
+			);
 
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
@@ -1032,6 +1050,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const maxSubagentDepth = resolveChildMaxSubagentDepth(params.maxSubagentDepth, agentConfig.maxSubagentDepth);
 			const interruptController = new AbortController();
 			if (foregroundControl) {
+				foregroundControl.activeChildren = 1;
 				foregroundControl.currentAgent = seqStep.agent;
 				foregroundControl.currentIndex = globalTaskIndex;
 				foregroundControl.currentActivityState = undefined;

@@ -179,7 +179,7 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 }
 
 function normalizeCriteria(criteria: Array<string | { id?: string; must?: string; evidence?: AcceptanceEvidenceKind[]; severity?: "required" | "recommended" }> | undefined, evidence: AcceptanceEvidenceKind[]): ResolvedAcceptanceGate[] {
-	return (criteria ?? []).map((criterion, index) => {
+	return (criteria ?? []).map((criterion, index): ResolvedAcceptanceGate => {
 		if (typeof criterion === "string") {
 			return { id: `criterion-${index + 1}`, must: criterion, evidence, severity: "required" };
 		}
@@ -215,7 +215,7 @@ export function resolveEffectiveAcceptance(input: {
 		evidence,
 	);
 	let review = explicit.review !== undefined ? explicit.review : inferred.review;
-	if (level === "reviewed" && explicitLevel !== "auto" && explicitLevel !== "reviewed" && explicit.review === undefined && review && review !== false) {
+	if (level === "reviewed" && explicitLevel !== "auto" && explicitLevel !== "reviewed" && explicit.review === undefined && review) {
 		review = { ...review, required: false };
 	}
 	return {
@@ -248,7 +248,7 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig): st
 		lines.push("", "Runtime verification commands configured by parent:");
 		for (const command of acceptance.verify) lines.push(`- ${command.id}: ${command.command}`);
 	}
-	if (acceptance.review && acceptance.review !== false) {
+	if (acceptance.review) {
 		lines.push("", `Review gate: ${acceptance.review.required === false ? "optional" : "required"}${acceptance.review.agent ? ` by ${acceptance.review.agent}` : ""}.`);
 		if (acceptance.review.focus) lines.push(`Review focus: ${acceptance.review.focus}`);
 	}
@@ -440,7 +440,7 @@ export function aggregateAcceptanceReport(input: {
 			{ id: "criterion-2", status: successfulChildren ? "satisfied" : "not-satisfied", evidence: successfulChildren ? "Collected child acceptance evidence for aggregate review." : "Dynamic fanout produced no aggregate review evidence." },
 			...input.results.map((result, index) => ({
 				id: `child-${index + 1}`,
-				status: result.exitCode === 0 && result.acceptance?.status !== "rejected" ? "satisfied" : "not-satisfied",
+				status: result.exitCode === 0 && result.acceptance?.status !== "rejected" ? "satisfied" as const : "not-satisfied" as const,
 				evidence: `${result.agent}: acceptance ${result.acceptance?.status ?? "unreported"}${result.error ? ` (${result.error})` : ""}`,
 			})),
 		],
@@ -577,7 +577,7 @@ export async function evaluateAcceptance(input: {
 			ledger.reviewResult = input.reviewResult;
 			ledger.status = input.reviewResult.status === "no-blockers" ? "reviewed" : "rejected";
 		} else {
-			const optionalReview = acceptance.review && acceptance.review !== false && acceptance.review.required === false;
+			const optionalReview = Boolean(acceptance.review && acceptance.review.required === false);
 			ledger.reviewResult = {
 				status: "needs-parent-decision",
 				findings: [{

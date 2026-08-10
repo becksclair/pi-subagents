@@ -3,8 +3,8 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { buildCompletionKey, getGlobalSeenMap, markSeenWithTtl } from "./completion-dedupe.ts";
-import { SUBAGENT_ASYNC_COMPLETE_EVENT } from "../../shared/types.ts";
+import { buildCompletionKey, getGlobalSeenMap, hasSeenWithTtl, markSeenWithTtl } from "./completion-dedupe.ts";
+import { SUBAGENT_ASYNC_COMPLETE_EVENT, type SubagentState } from "../../shared/types.ts";
 
 interface ChainStepResult {
 	agent: string;
@@ -38,9 +38,10 @@ interface SubagentResult {
 	results?: ChainStepResult[];
 	taskIndex?: number;
 	totalTasks?: number;
+	sessionId?: string | null;
 }
 
-export default function registerSubagentNotify(pi: ExtensionAPI): void {
+export default function registerSubagentNotify(pi: ExtensionAPI, state: Pick<SubagentState, "currentSessionId">): void {
 	const unsubscribeStoreKey = "__pi_subagents_notify_unsubscribe__";
 	const globalStore = globalThis as Record<string, unknown>;
 	const previousUnsubscribe = globalStore[unsubscribeStoreKey];
@@ -57,9 +58,10 @@ export default function registerSubagentNotify(pi: ExtensionAPI): void {
 
 	const handleComplete = (data: unknown) => {
 		const result = data as SubagentResult;
+		if (typeof result.sessionId !== "string" || result.sessionId !== state.currentSessionId) return;
 		const now = Date.now();
 		const key = buildCompletionKey(result, "notify");
-		if (markSeenWithTtl(seen, key, now, ttlMs)) return;
+		if (hasSeenWithTtl(seen, key, now, ttlMs)) return;
 
 		const agent = result.agent ?? "unknown";
 		const summary = typeof result.summary === "string" ? result.summary : "";
@@ -102,6 +104,7 @@ export default function registerSubagentNotify(pi: ExtensionAPI): void {
 			},
 			{ triggerTurn: true },
 		);
+		markSeenWithTtl(seen, key, Date.now(), ttlMs);
 	};
 
 	globalStore[unsubscribeStoreKey] = pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete);

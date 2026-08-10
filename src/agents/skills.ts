@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir } from "../shared/utils.ts";
+import { resolveProjectRoot } from "./agents.ts";
 
 export type SkillSource =
 	| "project"
@@ -316,21 +317,23 @@ function collectSettingsPackageSkillPaths(cwd: string, agentDir: string): SkillS
 }
 
 function buildSkillPaths(cwd: string, agentDir: string): SkillSearchPath[] {
+	const projectRoot = resolveProjectRoot(cwd);
 	const skillPaths: SkillSearchPath[] = [
-		{ path: path.join(cwd, CONFIG_DIR, "skills"), source: "project" },
-		{ path: path.join(cwd, ".agents", "skills"), source: "project" },
+		{ path: path.join(projectRoot, CONFIG_DIR, "skills"), source: "project" },
+		{ path: path.join(projectRoot, ".agents", "skills"), source: "project" },
 		{ path: path.join(agentDir, "skills"), source: "user" },
 		{ path: path.join(os.homedir(), ".agents", "skills"), source: "user" },
-		...collectInstalledPackageSkillPaths(cwd, agentDir),
-		...collectSettingsPackageSkillPaths(cwd, agentDir),
-		...extractSkillPathsFromPackageRoot(cwd, "project-package"),
-		...collectSettingsSkillPaths(cwd, agentDir),
+		...collectInstalledPackageSkillPaths(projectRoot, agentDir),
+		...collectSettingsPackageSkillPaths(projectRoot, agentDir),
+		...extractSkillPathsFromPackageRoot(projectRoot, "project-package"),
+		...collectSettingsSkillPaths(projectRoot, agentDir),
 	];
 
 	const deduped = new Map<string, SkillSearchPath>();
 	for (const entry of skillPaths) {
 		const resolvedPath = path.resolve(entry.path);
-		if (!deduped.has(resolvedPath)) {
+		const existing = deduped.get(resolvedPath);
+		if (!existing || (SOURCE_PRIORITY[entry.source] ?? 0) > (SOURCE_PRIORITY[existing.source] ?? 0)) {
 			deduped.set(resolvedPath, { path: resolvedPath, source: entry.source });
 		}
 	}
@@ -340,10 +343,11 @@ function buildSkillPaths(cwd: string, agentDir: string): SkillSearchPath[] {
 function inferSkillSource(filePath: string, cwd: string, agentDir: string, sourceHint?: SkillSource): SkillSource {
 	if (sourceHint) return sourceHint;
 
-	const projectConfigRoot = path.resolve(cwd, CONFIG_DIR);
-	const projectSkillsRoot = path.resolve(cwd, CONFIG_DIR, "skills");
-	const projectPackagesRoot = path.resolve(cwd, CONFIG_DIR, "npm", "node_modules");
-	const projectAgentsRoot = path.resolve(cwd, ".agents");
+	const projectRoot = resolveProjectRoot(cwd);
+	const projectConfigRoot = path.resolve(projectRoot, CONFIG_DIR);
+	const projectSkillsRoot = path.resolve(projectRoot, CONFIG_DIR, "skills");
+	const projectPackagesRoot = path.resolve(projectRoot, CONFIG_DIR, "npm", "node_modules");
+	const projectAgentsRoot = path.resolve(projectRoot, ".agents");
 	const userSkillsRoot = path.resolve(agentDir, "skills");
 	const userPackagesRoot = path.resolve(agentDir, "npm", "node_modules");
 	const userAgentRoot = path.resolve(agentDir);
@@ -393,21 +397,79 @@ function maybeReadSkillDescription(filePath: string): string | undefined {
 
 function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: SkillSearchPath[]): CachedSkillEntry[] {
 	const entries: CachedSkillEntry[] = [];
-	const seen = new Set<string>();
+	const seen = new Map<string, number>();
+	const visitedDirectories = new Map<string, number>();
 	let order = 0;
 
 	const pushEntry = (name: string, filePath: string, sourceHint?: SkillSource) => {
 		const resolvedFile = path.resolve(filePath);
-		if (seen.has(resolvedFile)) return;
 		if (!fs.existsSync(resolvedFile)) return;
-		seen.add(resolvedFile);
+		const source = inferSkillSource(resolvedFile, cwd, agentDir, sourceHint);
+		const existingIndex = seen.get(resolvedFile);
+		if (existingIndex !== undefined) {
+			const existing = entries[existingIndex];
+			if (existing && (SOURCE_PRIORITY[source] ?? 0) > (SOURCE_PRIORITY[existing.source] ?? 0)) {
+				entries[existingIndex] = {
+					...existing,
+					name,
+					source,
+					description: maybeReadSkillDescription(resolvedFile),
+				};
+			}
+			return;
+		}
+		seen.set(resolvedFile, entries.length);
 		entries.push({
 			name,
 			filePath: resolvedFile,
-			source: inferSkillSource(resolvedFile, cwd, agentDir, sourceHint),
+			source,
 			description: maybeReadSkillDescription(resolvedFile),
 			order: order++,
 		});
+	};
+
+	const shouldSkipDirectory = (name: string) => name.startsWith(".") || name === "node_modules";
+
+	const markDirectoryVisited = (dirPath: string, sourceHint?: SkillSource): boolean => {
+		let resolvedDir: string;
+		try {
+			resolvedDir = fs.realpathSync(dirPath);
+		} catch {
+			resolvedDir = path.resolve(dirPath);
+		}
+		const priority = sourceHint ? SOURCE_PRIORITY[sourceHint] ?? 0 : SOURCE_PRIORITY.unknown;
+		const previousPriority = visitedDirectories.get(resolvedDir);
+		if (previousPriority !== undefined && previousPriority >= priority) return false;
+		visitedDirectories.set(resolvedDir, priority);
+		return true;
+	};
+
+	const walkSkillDirectories = (dirPath: string, sourceHint?: SkillSource): void => {
+		if (!markDirectoryVisited(dirPath, sourceHint)) return;
+
+		const skillFile = path.join(dirPath, "SKILL.md");
+		if (fs.existsSync(skillFile)) {
+			pushEntry(path.basename(dirPath), skillFile, sourceHint);
+			return;
+		}
+
+		let entriesInDir: fs.Dirent[];
+		try {
+			entriesInDir = fs.readdirSync(dirPath, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entriesInDir) {
+			if (shouldSkipDirectory(entry.name)) continue;
+			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+			const entryPath = path.join(dirPath, entry.name);
+			try {
+				if (fs.statSync(entryPath).isDirectory()) walkSkillDirectories(entryPath, sourceHint);
+			} catch {
+				// Broken or transient symlinks are ignored during discovery.
+			}
+		}
 	};
 
 	for (const skillPath of skillPaths) {
@@ -435,8 +497,10 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 		const rootSkillFile = path.join(skillPath.path, "SKILL.md");
 		if (fs.existsSync(rootSkillFile)) {
 			pushEntry(path.basename(skillPath.path), rootSkillFile, skillPath.source);
+			continue;
 		}
 
+		markDirectoryVisited(skillPath.path, skillPath.source);
 		let childEntries: fs.Dirent[];
 		try {
 			childEntries = fs.readdirSync(skillPath.path, { withFileTypes: true });
@@ -445,12 +509,13 @@ function collectFilesystemSkills(cwd: string, agentDir: string, skillPaths: Skil
 		}
 
 		for (const child of childEntries) {
-			if (child.name.startsWith(".")) continue;
+			if (shouldSkipDirectory(child.name)) continue;
 			const childPath = path.join(skillPath.path, child.name);
 			if (child.isDirectory() || child.isSymbolicLink()) {
-				const nestedSkillPath = path.join(childPath, "SKILL.md");
-				if (fs.existsSync(nestedSkillPath)) {
-					pushEntry(child.name, nestedSkillPath, skillPath.source);
+				try {
+					if (fs.statSync(childPath).isDirectory()) walkSkillDirectories(childPath, skillPath.source);
+				} catch {
+					// Broken or transient symlinks are ignored during discovery.
 				}
 				continue;
 			}

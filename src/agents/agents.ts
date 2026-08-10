@@ -226,26 +226,57 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 	};
 }
 
-function findNearestProjectRoot(cwd: string): string | null {
-	let currentDir = cwd;
+function findGitRoot(cwd: string): string | null {
+	let currentDir = path.resolve(cwd);
 	while (true) {
-		if (isDirectory(path.join(currentDir, ".pi")) || isDirectory(path.join(currentDir, ".agents"))) {
-			return currentDir;
-		}
-
+		if (fs.existsSync(path.join(currentDir, ".git"))) return currentDir;
 		const parentDir = path.dirname(currentDir);
 		if (parentDir === currentDir) return null;
 		currentDir = parentDir;
 	}
 }
 
+function findNearestProjectRoot(cwd: string): string | null {
+	const resolvedCwd = path.resolve(cwd);
+	const gitRoot = findGitRoot(resolvedCwd);
+
+	// Outside a Git checkout, an ancestor `.agents` directory is an explicit
+	// legacy project marker and may define the project root. A bare ancestor
+	// `.pi` directory is deliberately *not* inherited: generic parent locations
+	// such as `/tmp/.pi` must never redirect writes from unrelated cwd trees.
+	if (!gitRoot) {
+		if (isDirectory(path.join(resolvedCwd, ".pi")) || isDirectory(path.join(resolvedCwd, ".agents"))) return resolvedCwd;
+		let currentDir = path.dirname(resolvedCwd);
+		while (true) {
+			if (isDirectory(path.join(currentDir, ".agents"))) return currentDir;
+			const parentDir = path.dirname(currentDir);
+			if (parentDir === currentDir) return null;
+			currentDir = parentDir;
+		}
+	}
+
+	let currentDir = resolvedCwd;
+	while (true) {
+		if (isDirectory(path.join(currentDir, ".pi")) || isDirectory(path.join(currentDir, ".agents"))) {
+			return currentDir;
+		}
+		if (currentDir === gitRoot) return null;
+		const parentDir = path.dirname(currentDir);
+		if (!parentDir.startsWith(gitRoot)) return null;
+		currentDir = parentDir;
+	}
+}
+
+export function resolveProjectRoot(cwd: string): string {
+	return findNearestProjectRoot(cwd) ?? findGitRoot(cwd) ?? path.resolve(cwd);
+}
+
 function getUserAgentSettingsPath(): string {
 	return path.join(getAgentDir(), "settings.json");
 }
 
-function getProjectAgentSettingsPath(cwd: string): string | null {
-	const projectRoot = findNearestProjectRoot(cwd);
-	return projectRoot ? path.join(projectRoot, ".pi", "settings.json") : null;
+function getProjectAgentSettingsPath(cwd: string): string {
+	return path.join(resolveProjectRoot(cwd), ".pi", "settings.json");
 }
 
 function readSettingsFileStrict(filePath: string): Record<string, unknown> {
@@ -578,10 +609,18 @@ function listFilesRecursive(dir: string, predicate: (fileName: string) => boolea
 	return files;
 }
 
+function isLegacyAgentSkillPath(rootDir: string, filePath: string): boolean {
+	const relative = path.relative(rootDir, filePath);
+	const parts = relative.split(path.sep).map((part) => part.toLowerCase());
+	if (path.basename(rootDir).toLowerCase() === ".agents") parts.unshift(".agents");
+	return parts.some((part, index) => part === ".agents" && parts[index + 1] === "skills");
+}
+
 function loadAgentsFromDir(dir: string, source: AgentSource, options: { recursive?: boolean } = {}): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"), options)) {
+		if (isLegacyAgentSkillPath(dir, filePath)) continue;
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
@@ -743,7 +782,10 @@ function isDirectory(p: string): boolean {
 }
 
 function resolveNearestProjectAgentDirs(cwd: string): { readDirs: string[]; preferredDir: string | null } {
-	const projectRoot = findNearestProjectRoot(cwd);
+	// Existing project markers win. Inside a Git checkout with no marker yet,
+	// use the repository root as the canonical write target so an explicit
+	// project-agent create from a nested cwd does not manufacture nested/.pi.
+	const projectRoot = resolveProjectRoot(cwd);
 	if (!projectRoot) return { readDirs: [], preferredDir: null };
 
 	const legacyDir = path.join(projectRoot, ".agents");
@@ -759,7 +801,7 @@ function resolveNearestProjectAgentDirs(cwd: string): { readDirs: string[]; pref
 }
 
 function resolveNearestProjectChainDirs(cwd: string): { readDirs: string[]; preferredDir: string | null } {
-	const projectRoot = findNearestProjectRoot(cwd);
+	const projectRoot = resolveProjectRoot(cwd);
 	if (!projectRoot) return { readDirs: [], preferredDir: null };
 
 	const preferredDir = path.join(projectRoot, ".pi", "chains");

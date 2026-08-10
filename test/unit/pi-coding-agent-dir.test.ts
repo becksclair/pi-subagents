@@ -48,7 +48,7 @@ describe("PI_CODING_AGENT_DIR runtime paths", () => {
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	it("resolves the agent dir dynamically and loads extension config from it", () => {
+	it("resolves the agent dir dynamically and merges canonical runtime settings over legacy config", () => {
 		assert.equal(getAgentDir(), agentDir);
 
 		process.env.PI_CODING_AGENT_DIR = "~";
@@ -62,11 +62,52 @@ describe("PI_CODING_AGENT_DIR runtime paths", () => {
 
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
-		writeFile(configPath, JSON.stringify({ asyncByDefault: true, maxSubagentDepth: 3 }));
+		writeFile(configPath, JSON.stringify({ asyncByDefault: true, maxSubagentDepth: 3, childTimeoutMs: 120_000 }));
+		writeFile(path.join(agentDir, "settings.json"), JSON.stringify({
+			subagents: {
+				runtime: { maxSubagentDepth: 4, childTimeoutMs: 360_000 },
+			},
+		}, null, 2));
 
 		const config = loadConfig();
-		assert.equal(config.asyncByDefault, true);
-		assert.equal(config.maxSubagentDepth, 3);
+		assert.equal(config.asyncByDefault, true, "legacy-only keys remain available during migration");
+		assert.equal(config.maxSubagentDepth, 4, "canonical settings override the legacy file");
+		assert.equal(config.childTimeoutMs, 360_000);
+	});
+
+	it("drops malformed runtime settings instead of letting them poison later execution", () => {
+		const legacyPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(legacyPath, JSON.stringify({
+			asyncByDefault: true,
+			defaultSessionDir: "/safe/sessions",
+			childTimeoutMs: 120_000,
+		}));
+		writeFile(path.join(agentDir, "settings.json"), JSON.stringify({
+			subagents: {
+				runtime: {
+					asyncByDefault: "yes",
+					defaultSessionDir: 42,
+					childTimeoutMs: "potato",
+					maxSubagentDepth: -1,
+					worktreeSetupHook: { command: "oops" },
+					control: { enabled: "false", needsAttentionAfterMs: 5000 },
+					parallel: { maxTasks: "many", concurrency: 2 },
+					chain: { dynamicFanout: { maxItems: 7 } },
+					intercomBridge: { mode: "sometimes", instructionFile: 123 },
+				},
+			},
+		}, null, 2));
+
+		const config = loadConfig();
+		assert.equal(config.asyncByDefault, true, "invalid canonical boolean must not replace valid legacy value");
+		assert.equal(config.defaultSessionDir, "/safe/sessions");
+		assert.equal(config.childTimeoutMs, 120_000);
+		assert.equal(config.maxSubagentDepth, undefined);
+		assert.equal(config.worktreeSetupHook, undefined);
+		assert.deepEqual(config.control, { needsAttentionAfterMs: 5000 });
+		assert.deepEqual(config.parallel, { concurrency: 2 });
+		assert.deepEqual(config.chain, { dynamicFanout: { maxItems: 7 } });
+		assert.deepEqual(config.intercomBridge, {});
 	});
 
 	it("discovers user agents, chains, and settings under the configured agent dir", () => {

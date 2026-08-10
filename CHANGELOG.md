@@ -1,3 +1,22 @@
+# Local fork notes
+
+## 0.26.0-bex.1
+
+- Base: upstream `pi-subagents` v0.26.0.
+- Retained Asgard fixes for dynamic fanout schema compatibility, machine-local config hygiene, user `~/.agents` discovery, and child wall-clock timeout.
+- Updated compatibility to Pi 0.84.x.
+- Added compact provider/model, Git, file-diff, context-usage, and active-child footer with ANSI-safe narrow-terminal truncation.
+- Prevented unrelated ancestor `.pi` directories from hijacking non-Git project writes, and anchor explicit nested-cwd project writes at the Git root.
+- Kept automatic progress bookkeeping out of project trees by isolating parallel/async `progress.md` under subagent runtime state.
+- Added exact session ownership for async lifecycle/results, bounded streamed progress and async diagnostic logs, stronger atomic status-cache invalidation, and a duplicate top-level dispatch guard.
+- Hardened the retained runtime with parent-session model inheritance, nested-cwd project/skill resolution, recursive skill discovery with source precedence, skill/agent namespace separation, and child-safe fanout registration without duplicate tools.
+- Prewarmed fork branches before parallel dispatch, retried genuinely empty provider responses through model fallbacks, bounded newline-less child protocol output, and reinforced per-run output paths in both task and system prompts.
+- Made completion delivery reload-safe (delivery commits only after successful notification and stale watcher callbacks lose ownership) and validate runtime settings so malformed hand edits degrade safely instead of poisoning path/process code.
+- Removed packaged workflow prompt shortcuts and the legacy self-installer from this fork.
+- Package is private to avoid accidental publication under the upstream npm name.
+
+---
+
 # Changelog
 
 ## [Unreleased]

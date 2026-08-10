@@ -195,7 +195,7 @@ export interface SubagentResultIntercomPayload {
 // ============================================================================
 
 export interface AgentProgress {
-	index: number;
+	index?: number;
 	agent: string;
 	status: "pending" | "running" | "completed" | "failed" | "detached";
 	activityState?: ActivityState;
@@ -221,7 +221,7 @@ export interface ToolCallSummary {
 	expandedText: string;
 }
 
-interface ProgressSummary {
+export interface ProgressSummary extends Partial<AgentProgress> {
 	toolCount: number;
 	tokens: number;
 	durationMs: number;
@@ -682,6 +682,7 @@ export interface ForegroundResumeRun {
 export interface SubagentState {
 	baseCwd: string;
 	currentSessionId: string | null;
+	subagentInProgress?: boolean;
 	asyncJobs: Map<string, AsyncJobState>;
 	foregroundRuns?: Map<string, ForegroundResumeRun>;
 	foregroundControls: Map<string, {
@@ -691,6 +692,8 @@ export interface SubagentState {
 		updatedAt: number;
 		currentAgent?: string;
 		currentIndex?: number;
+		/** Number of child agents currently active in this foreground orchestration. */
+		activeChildren?: number;
 		currentActivityState?: ActivityState;
 		lastActivityAt?: number;
 		currentTool?: string;

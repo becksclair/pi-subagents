@@ -276,6 +276,32 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.ok((args.at(-1) ?? "").startsWith("Task: \n\n## Acceptance Contract"));
 	});
 
+	it("pins unconfigured children to the parent session model", async () => {
+		const { manager } = makeSessionManagerRecorder();
+		const executor = makeExecutor();
+		const ctx = {
+			...makeCtx(manager),
+			model: { provider: "openai-codex", id: "gpt-5.6-luna" },
+			modelRegistry: {
+				getAvailable: () => [{ provider: "openai-codex", id: "gpt-5.6-luna" }],
+			},
+		};
+
+		const result = await executor.execute(
+			"parent-model",
+			{ agent: "echo", task: "inherit current model" },
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		assert.equal(result.isError, undefined);
+		const args = readCallArgs();
+		const modelIndex = args.indexOf("--model");
+		assert.notEqual(modelIndex, -1);
+		assert.equal(args[modelIndex + 1], "openai-codex/gpt-5.6-luna");
+	});
+
 	it("does not treat top-level agent as single mode when tasks are present", async () => {
 		const { manager } = makeSessionManagerRecorder();
 		const executor = makeExecutor();

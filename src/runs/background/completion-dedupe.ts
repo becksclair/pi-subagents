@@ -46,6 +46,11 @@ function pruneSeenMap(seen: Map<string, number>, now: number, ttlMs: number): vo
 	}
 }
 
+export function hasSeenWithTtl(seen: Map<string, number>, key: string, now: number, ttlMs: number): boolean {
+	pruneSeenMap(seen, now, ttlMs);
+	return seen.has(key);
+}
+
 export function markSeenWithTtl(seen: Map<string, number>, key: string, now: number, ttlMs: number): boolean {
 	pruneSeenMap(seen, now, ttlMs);
 	if (seen.has(key)) return true;

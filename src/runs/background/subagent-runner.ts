@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { appendJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
+import { appendJsonl as appendRawJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
@@ -50,6 +50,7 @@ import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelSt
 import { nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES } from "../shared/child-protocol.ts";
 import {
 	WALL_CLOCK_TIMEOUT_EXIT_CODE,
 	armWallClockTimeout,
@@ -136,6 +137,78 @@ interface StepResult {
 }
 
 const ASYNC_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
+const DEFAULT_MAX_ASYNC_EVENTS_BYTES = 50 * 1024 * 1024;
+const ASYNC_EVENTS_MAX_BYTES_ENV = "PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES";
+const TRUNCATED_EVENT_TYPE = "subagent.events.truncated";
+const TRUNCATION_MARKER_RESERVE_BYTES = 512;
+
+interface AsyncEventLogState {
+	bytes: number;
+	diagnosticsTruncated: boolean;
+}
+
+const asyncEventLogStates = new Map<string, AsyncEventLogState>();
+
+function maxAsyncEventsBytes(): number {
+	const raw = process.env[ASYNC_EVENTS_MAX_BYTES_ENV];
+	if (!raw) return DEFAULT_MAX_ASYNC_EVENTS_BYTES;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MAX_ASYNC_EVENTS_BYTES;
+	return Math.floor(parsed);
+}
+
+function eventLogState(filePath: string): AsyncEventLogState {
+	let state = asyncEventLogStates.get(filePath);
+	if (state) return state;
+	let bytes = 0;
+	try {
+		bytes = fs.statSync(filePath).size;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			// Diagnostic accounting is best-effort. The run must not fail because
+			// its event log became unreadable between writes.
+		}
+	}
+	state = { bytes, diagnosticsTruncated: false };
+	asyncEventLogStates.set(filePath, state);
+	return state;
+}
+
+function appendJsonl(filePath: string, line: string): void {
+	try {
+		appendRawJsonl(filePath, line);
+		const state = asyncEventLogStates.get(filePath);
+		if (state) state.bytes += Buffer.byteLength(`${line}\n`, "utf-8");
+	} catch {
+		// Event logging is diagnostic and must not fail an async run.
+	}
+}
+
+function appendDiagnosticJsonl(filePath: string, line: string, droppedEventType?: string): void {
+	if (!line.trim()) return;
+	const state = eventLogState(filePath);
+	if (state.diagnosticsTruncated) return;
+	const maxBytes = maxAsyncEventsBytes();
+	const chunkBytes = Buffer.byteLength(`${line}\n`, "utf-8");
+	const diagnosticBudget = Math.max(0, maxBytes - TRUNCATION_MARKER_RESERVE_BYTES);
+	if (state.bytes + chunkBytes <= diagnosticBudget) {
+		appendJsonl(filePath, line);
+		return;
+	}
+
+	const marker = JSON.stringify({
+		type: TRUNCATED_EVENT_TYPE,
+		ts: Date.now(),
+		maxBytes,
+		droppedEventType,
+	});
+	if (state.bytes + Buffer.byteLength(`${marker}\n`, "utf-8") <= maxBytes) appendJsonl(filePath, marker);
+	state.diagnosticsTruncated = true;
+}
+
+function shouldPersistChildEvent(event: Record<string, unknown>): boolean {
+	return event.type !== "message_update";
+}
 
 function findLatestSessionFile(sessionDir: string): string | null {
 	try {
@@ -255,9 +328,8 @@ function runPiStreaming(
 			env: spawnEnv,
 			windowsHide: true,
 		});
-		let stderr = "";
-		let stdoutBuf = "";
-		let stderrBuf = "";
+		const stderrTail = createBoundedByteTail();
+		const rawStdoutTail = createBoundedByteTail();
 		const messages: Message[] = [];
 		const usage = emptyUsage();
 		let model: string | undefined;
@@ -265,7 +337,7 @@ function runPiStreaming(
 		let assistantError: string | undefined;
 		let interrupted = false;
 		let observedMutationAttempt = false;
-		const rawStdoutLines: string[] = [];
+		let protocolHardKillTimer: NodeJS.Timeout | undefined;
 
 		const writeOutputLine = (line: string) => {
 			if (!line.trim()) return;
@@ -279,15 +351,15 @@ function runPiStreaming(
 		};
 
 		const appendChildEvent = (event: Record<string, unknown>) => {
-			if (!childEventContext) return;
-			appendJsonl(childEventContext.eventsPath, JSON.stringify({
+			if (!childEventContext || !shouldPersistChildEvent(event)) return;
+			appendDiagnosticJsonl(childEventContext.eventsPath, JSON.stringify({
 				...event,
 				subagentSource: "child",
 				subagentRunId: childEventContext.runId,
 				subagentStepIndex: childEventContext.stepIndex,
 				subagentAgent: childEventContext.agent,
 				observedAt: Date.now(),
-			}));
+			}), typeof event.type === "string" ? event.type : undefined);
 		};
 
 		const appendChildLine = (type: "subagent.child.stdout" | "subagent.child.stderr", line: string) => {
@@ -300,13 +372,13 @@ function runPiStreaming(
 			try {
 				event = JSON.parse(line) as ChildEvent;
 			} catch {
-				rawStdoutLines.push(line);
+				rawStdoutTail.push(`${line}\n`);
 				writeOutputLine(line);
 				appendChildLine("subagent.child.stdout", line);
 				return;
 			}
 
-			appendChildEvent(event);
+			appendChildEvent(event as unknown as Record<string, unknown>);
 			onChildEvent?.(event);
 
 			if (event.type === "tool_execution_start" && event.toolName) {
@@ -344,19 +416,6 @@ function runPiStreaming(
 			}
 		};
 
-		const processStderrText = (text: string) => {
-			stderr += text;
-			stderrBuf += text;
-			outputStream.write(text);
-			if (!childEventContext) return;
-			const lines = stderrBuf.split("\n");
-			stderrBuf = lines.pop() || "";
-			for (const line of lines) {
-				if (!line.trim()) continue;
-				appendChildLine("subagent.child.stderr", line);
-			}
-		};
-
 		// Guard both cases that can leave the parent waiting on `close` forever:
 		// a lingering stdio holder after `exit`, or a child that never exits.
 		const FINAL_STOP_GRACE_MS = 1000;
@@ -367,6 +426,24 @@ function runPiStreaming(
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardKillTimer: NodeJS.Timeout | undefined;
 		let settled = false;
+		const failProtocol = (limit: Parameters<typeof formatProtocolOutputLimit>[0]) => {
+			if (error?.startsWith("protocol_output_limit:")) return;
+			error = formatProtocolOutputLimit(limit);
+			if (!childExited) {
+				trySignalChild(child, "SIGTERM");
+				protocolHardKillTimer = setTimeout(() => {
+					if (!settled) trySignalChild(child, "SIGKILL");
+				}, 3000);
+				protocolHardKillTimer.unref?.();
+			}
+		};
+		const stdoutReader = createBoundedLineReader({ onLine: processStdoutLine, onLimit: failProtocol });
+		const stderrReader = createBoundedLineReader({
+			stream: "stderr",
+			maxPendingLineBytes: MAX_CHILD_STDERR_BYTES,
+			onLine: (line) => appendChildLine("subagent.child.stderr", line),
+			onLimit: (limit) => appendChildLine("subagent.child.stderr", formatProtocolOutputLimit(limit)),
+		});
 		const clearStdioGuard = attachPostExitStdioGuard(child, { idleMs: 2000, hardMs: 8000 });
 		const wallClock = armWallClockTimeout(child, wallClockTimeoutMs, {
 			isCancelled: () => settled,
@@ -374,16 +451,12 @@ function runPiStreaming(
 				error = error ?? wallClockTimeoutMessage(wallClockTimeoutMs ?? 0);
 			},
 		});
-		child.stdout.on("data", (chunk: Buffer) => {
-			const text = chunk.toString();
-			stdoutBuf += text;
-			const lines = stdoutBuf.split("\n");
-			stdoutBuf = lines.pop() || "";
-			for (const line of lines) processStdoutLine(line);
-		});
+		child.stdout.on("data", (chunk: Buffer) => stdoutReader.push(chunk));
 
 		child.stderr.on("data", (chunk: Buffer) => {
-			processStderrText(chunk.toString());
+			stderrTail.push(chunk);
+			stderrReader.push(chunk);
+			outputStream.write(chunk);
 		});
 		registerInterrupt?.(() => {
 			if (settled) return;
@@ -402,6 +475,10 @@ function runPiStreaming(
 			if (finalHardKillTimer) {
 				clearTimeout(finalHardKillTimer);
 				finalHardKillTimer = undefined;
+			}
+			if (protocolHardKillTimer) {
+				clearTimeout(protocolHardKillTimer);
+				protocolHardKillTimer = undefined;
 			}
 		};
 		function startFinalDrain(): void {
@@ -432,10 +509,11 @@ function runPiStreaming(
 			wallClock.clear();
 			clearDrainTimers();
 			clearStdioGuard();
-			if (stdoutBuf.trim()) processStdoutLine(stdoutBuf);
-			if (stderrBuf.trim()) appendChildLine("subagent.child.stderr", stderrBuf);
+			stdoutReader.end();
+			stderrReader.end();
 			outputStream.end();
-			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
+			const stderr = stderrTail.text();
+			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
 			const finalError = error ?? assistantError;
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !finalError;
 			resolve({
@@ -459,8 +537,11 @@ function runPiStreaming(
 			wallClock.clear();
 			clearDrainTimers();
 			clearStdioGuard();
+			stdoutReader.end();
+			stderrReader.end();
 			outputStream.end();
-			const finalOutput = getFinalOutput(messages) || rawStdoutLines.join("\n").trim();
+			const stderr = stderrTail.text();
+			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
 			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
 			resolve({ stderr, exitCode: 1, messages, usage, model, error: error ?? assistantError ?? spawnErrorMessage, finalOutput, observedMutationAttempt });
 		});
@@ -711,6 +792,14 @@ async function runSingleStep(
 		cleanupTempDir(tempDir);
 
 		const hiddenError = run.exitCode === 0 && !run.error ? detectSubagentError(run.messages) : null;
+		const emptyOutputError = run.exitCode === 0
+			&& !run.error
+			&& !hiddenError?.hasError
+			&& !effectiveStructuredOutput
+			&& !step.outputPath
+			&& !run.finalOutput.trim()
+			? "Subagent produced no output (possible model cold-start or empty response)."
+			: undefined;
 		let structuredOutput: unknown;
 		let structuredError: string | undefined;
 		if (effectiveStructuredOutput && run.exitCode === 0 && !run.error && !hiddenError?.hasError) {
@@ -722,7 +811,7 @@ async function runSingleStep(
 			if (structured.error) structuredError = structured.error;
 			else structuredOutput = structured.value;
 		}
-		const completionGuard = run.exitCode === 0 && !run.error && !hiddenError?.hasError && step.completionGuard !== false
+		const completionGuard = run.exitCode === 0 && !run.error && !hiddenError?.hasError && !emptyOutputError && step.completionGuard !== false
 			? evaluateCompletionMutationGuard({
 				agent: step.agent,
 				task: taskForCompletionGuard,
@@ -739,6 +828,8 @@ async function runSingleStep(
 			? 1
 			: structuredError
 				? 1
+				: emptyOutputError
+					? 1
 				: hiddenError?.hasError
 				? (hiddenError.exitCode ?? 1)
 				: run.error && run.exitCode === 0
@@ -746,6 +837,7 @@ async function runSingleStep(
 					: run.exitCode;
 		const error = completionGuardError
 			?? structuredError
+			?? emptyOutputError
 			?? (hiddenError?.hasError
 				? hiddenError.details
 					? `${hiddenError.errorType} failed (exit ${effectiveExitCode}): ${hiddenError.details}`

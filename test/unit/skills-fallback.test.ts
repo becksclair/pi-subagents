@@ -157,6 +157,31 @@ describe("skills filesystem fallback", () => {
 		assert.equal(resolved[0]?.source, "project-package");
 	});
 
+	it("anchors package and settings skill discovery at the project root from a nested cwd", () => {
+		fs.mkdirSync(path.join(tempDir, ".git"), { recursive: true });
+		makePackageSkill(tempDir, "root-package-skill", "Root package skill.");
+		makeProjectSkill(tempDir, "root-project-skill", "Root project skill.");
+		const nested = path.join(tempDir, "packages", "app", "src");
+		fs.mkdirSync(nested, { recursive: true });
+
+		const { resolved, missing } = resolveSkills(["root-package-skill", "root-project-skill"], nested);
+		assert.deepEqual(missing, []);
+		assert.deepEqual(resolved.map((skill) => skill.name), ["root-package-skill", "root-project-skill"]);
+		assert.equal(resolved.find((skill) => skill.name === "root-package-skill")?.source, "project-package");
+		assert.equal(resolved.find((skill) => skill.name === "root-project-skill")?.source, "project");
+	});
+
+	it("discovers deeply nested project skills", () => {
+		const skillDir = path.join(tempDir, ".pi", "skills", "families", "review", "deep-skill");
+		fs.mkdirSync(skillDir, { recursive: true });
+		fs.writeFileSync(path.join(skillDir, "SKILL.md"), "---\ndescription: Deep skill\n---\n\nDeep body\n", "utf-8");
+
+		const { resolved, missing } = resolveSkills(["deep-skill"], tempDir);
+		assert.deepEqual(missing, []);
+		assert.equal(resolved[0]?.source, "project");
+		assert.match(resolved[0]?.content ?? "", /Deep body/);
+	});
+
 	it("falls back to the runtime cwd when the execution cwd lacks the skill", () => {
 		const nestedDir = path.join(tempDir, "nested");
 		fs.mkdirSync(nestedDir, { recursive: true });

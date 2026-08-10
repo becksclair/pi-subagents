@@ -305,8 +305,12 @@ Inspect
 		);
 
 		const args = readLastCallArgs();
-		assert.ok((args.at(-1) ?? "").includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
-		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+		const taskArg = args.at(-1) ?? "";
+		const progressPath = /Update progress at: ([^\n]+\/progress\.md)/.exec(taskArg)?.[1];
+		assert.ok(progressPath, "expected an isolated progress path in the child task");
+		assert.notEqual(progressPath, path.join(tempDir, "progress.md"));
+		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), false);
+		assert.equal(fs.existsSync(progressPath), true);
 	});
 
 	it("top-level parallel suppresses progress when the task is review-only", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

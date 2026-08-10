@@ -82,6 +82,37 @@ describe("agent management config parsing", () => {
 		assert.equal(fs.existsSync(updatedPath), false);
 	});
 
+	it("does not inherit an unrelated ancestor .pi directory outside a git project", () => {
+		const parentPi = path.join(tempDir, ".pi", "agents");
+		const nested = path.join(tempDir, "unrelated", "work");
+		fs.mkdirSync(parentPi, { recursive: true });
+		fs.mkdirSync(nested, { recursive: true });
+
+		const result = handleCreate(
+			{ config: { name: "local-only", description: "Stay in cwd", scope: "project" } },
+			{ cwd: nested, modelRegistry: { getAvailable: () => [] } },
+		);
+
+		assert.equal(result.isError, false);
+		assert.equal(fs.existsSync(path.join(parentPi, "local-only.md")), false);
+		assert.equal(fs.existsSync(path.join(nested, ".pi", "agents", "local-only.md")), true);
+	});
+
+	it("creates project agents at the git root when invoked from a nested cwd", () => {
+		const nested = path.join(tempDir, "packages", "app");
+		fs.mkdirSync(path.join(tempDir, ".git"), { recursive: true });
+		fs.mkdirSync(nested, { recursive: true });
+
+		const result = handleCreate(
+			{ config: { name: "repo-agent", description: "Repository scoped", scope: "project" } },
+			{ cwd: nested, modelRegistry: { getAvailable: () => [] } },
+		);
+
+		assert.equal(result.isError, false);
+		assert.equal(fs.existsSync(path.join(tempDir, ".pi", "agents", "repo-agent.md")), true);
+		assert.equal(fs.existsSync(path.join(nested, ".pi", "agents", "repo-agent.md")), false);
+	});
+
 	it("rejects package values that cannot be normalized", () => {
 		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
 		const created = handleCreate(

@@ -20,7 +20,7 @@ export function getAgentDir(): string {
 	return configured || path.join(os.homedir(), ".pi", "agent");
 }
 
-const statusCache = new Map<string, { mtime: number; status: AsyncStatus }>();
+const statusCache = new Map<string, { mtime: number; ctime: number; size: number; ino: number; status: AsyncStatus }>();
 
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -55,7 +55,13 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 	}
 
 	const cached = statusCache.get(statusPath);
-	if (cached && cached.mtime === stat.mtimeMs) {
+	if (
+		cached
+		&& cached.mtime === stat.mtimeMs
+		&& cached.ctime === stat.ctimeMs
+		&& cached.size === stat.size
+		&& cached.ino === stat.ino
+	) {
 		return cached.status;
 	}
 
@@ -78,7 +84,13 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 		});
 	}
 
-	statusCache.set(statusPath, { mtime: stat.mtimeMs, status });
+	statusCache.set(statusPath, {
+		mtime: stat.mtimeMs,
+		ctime: stat.ctimeMs,
+		size: stat.size,
+		ino: stat.ino,
+		status,
+	});
 	if (statusCache.size > 50) {
 		const firstKey = statusCache.keys().next().value;
 		if (firstKey) statusCache.delete(firstKey);
@@ -278,6 +290,31 @@ export function compactForegroundDetails(details: Details): Details {
 			? details.progress.map(compactCompletedProgress)
 			: undefined,
 	};
+}
+
+// Running progress is serialized into tool update events. Keep those snapshots
+// bounded independently of the final result so long/deep fan-out cannot inflate
+// a single protocol line with the full child transcript and tool history.
+export const MAX_STREAMED_RECENT_TOOLS = 32;
+export const MAX_STREAMED_TOOL_CALLS = 64;
+export const MAX_STREAMED_OUTPUT_LINE_CHARS = 2000;
+
+export function boundStreamedRecentTools(recentTools: AgentProgress["recentTools"]): AgentProgress["recentTools"] {
+	return recentTools.slice(-MAX_STREAMED_RECENT_TOOLS).map((tool) => ({ ...tool }));
+}
+
+export function boundStreamedRecentOutput(recentOutput: string[]): string[] {
+	return recentOutput.map((line) =>
+		line.length > MAX_STREAMED_OUTPUT_LINE_CHARS
+			? `${line.slice(0, MAX_STREAMED_OUTPUT_LINE_CHARS)}… [truncated]`
+			: line,
+	);
+}
+
+export function boundStreamedToolCalls(result: Pick<SingleResult, "toolCalls" | "messages">): ToolCallSummary[] | undefined {
+	const summaries = result.toolCalls?.length ? result.toolCalls : extractToolCallSummaries(result.messages);
+	if (!summaries.length) return undefined;
+	return summaries.slice(-MAX_STREAMED_TOOL_CALLS).map((summary) => ({ ...summary }));
 }
 
 /**

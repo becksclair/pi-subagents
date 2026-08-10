@@ -14,7 +14,7 @@ function createPi() {
 		},
 	};
 
-	registerSubagentNotify(pi as never);
+	registerSubagentNotify(pi as never, { currentSessionId: "session-1" });
 
 	return { events, sent };
 }
@@ -25,6 +25,7 @@ describe("registerSubagentNotify", () => {
 
 		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 			id: "notify-empty-1",
+			sessionId: "session-1",
 			agent: "worker",
 			success: true,
 			summary: "",
@@ -49,6 +50,7 @@ describe("registerSubagentNotify", () => {
 
 		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 			id: "notify-summary-1",
+			sessionId: "session-1",
 			agent: "worker",
 			success: true,
 			summary,
@@ -74,6 +76,7 @@ describe("registerSubagentNotify", () => {
 
 		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 			id: "notify-path-1",
+			sessionId: "session-1",
 			agent: "worker",
 			success: true,
 			summary: "Done",
@@ -97,6 +100,7 @@ describe("registerSubagentNotify", () => {
 
 		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
 			id: "notify-paused-1",
+			sessionId: "session-1",
 			agent: "worker",
 			success: false,
 			state: "paused",
@@ -113,5 +117,56 @@ describe("registerSubagentNotify", () => {
 			},
 			options: { triggerTurn: true },
 		});
+	});
+
+	it("retries the same completion after synchronous sendMessage failure", () => {
+		const events = new EventEmitter();
+		let attempts = 0;
+		const sent: unknown[] = [];
+		const pi = {
+			events,
+			sendMessage(message: unknown) {
+				attempts += 1;
+				if (attempts === 1) throw new Error("stale extension context");
+				sent.push(message);
+			},
+		};
+		registerSubagentNotify(pi as never, { currentSessionId: "session-retry" });
+		const completion = {
+			id: "notify-retry-after-send-failure",
+			sessionId: "session-retry",
+			agent: "worker",
+			success: true,
+			summary: "eventually delivered",
+			timestamp: 1001,
+		};
+
+		assert.throws(() => events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completion), /stale extension context/);
+		assert.equal(sent.length, 0);
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completion);
+		assert.equal(attempts, 2);
+		assert.equal(sent.length, 1);
+	});
+
+	it("ignores completions owned by another Pi session", () => {
+		const { events, sent } = createPi();
+
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
+			id: "notify-foreign-1",
+			sessionId: "session-2",
+			agent: "worker",
+			success: true,
+			summary: "belongs elsewhere",
+			timestamp: 999,
+		});
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, {
+			id: "notify-legacy-sessionless",
+			agent: "worker",
+			success: true,
+			summary: "legacy sessionless result",
+			timestamp: 1000,
+		});
+
+		assert.deepEqual(sent, []);
 	});
 });

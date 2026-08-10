@@ -13,7 +13,7 @@ import { handleManagementAction } from "../../agents/agent-management.ts";
 import { buildDoctorReport } from "../../extension/doctor.ts";
 import { clearPendingForegroundControlNotices } from "../../extension/control-notices.ts";
 import { runSync } from "./execution.ts";
-import { resolveModelCandidate } from "../shared/model-fallback.ts";
+import { resolveSubagentModelOverride } from "../shared/model-fallback.ts";
 import { aggregateParallelOutputs } from "../shared/parallel-utils.ts";
 import { recordRun } from "../shared/run-history.ts";
 import {
@@ -26,6 +26,7 @@ import {
 	suppressProgressForReadOnlyTask,
 	taskDisallowsFileUpdates,
 	type ChainStep,
+	type ParallelStep,
 	type ResolvedStepBehavior,
 	type SequentialStep,
 	type StepOverrides,
@@ -649,6 +650,7 @@ async function resumeAsyncRun(input: {
 			cwd: input.requestCwd,
 			currentSessionId: input.deps.state.currentSessionId,
 			currentModelProvider: input.ctx.model?.provider,
+			currentModel: input.ctx.model,
 		},
 		cwd: effectiveCwd,
 		maxOutput: input.params.maxOutput,
@@ -1082,6 +1084,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		cwd: ctx.cwd,
 		currentSessionId: deps.state.currentSessionId!,
 		currentModelProvider: ctx.model?.provider,
+		currentModel: ctx.model,
 	};
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentMaxSubagentDepth = resolveCurrentMaxSubagentDepth(deps.config.maxSubagentDepth);
@@ -1092,7 +1095,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 	if (hasTasks && params.tasks) {
 		const agentConfigs = params.tasks.map((task) => agents.find((agent) => agent.name === task.agent));
 		const modelOverrides = params.tasks.map((task, index) =>
-			resolveModelCandidate(task.model ?? agentConfigs[index]?.model, availableModels, currentProvider),
+			resolveSubagentModelOverride(task.model ?? agentConfigs[index]?.model, ctx.model, availableModels, currentProvider),
 		);
 		const skillOverrides = params.tasks.map((task) => normalizeSkillInput(task.skill));
 		const parallelTasks = params.tasks.map((task, index) => ({
@@ -1179,7 +1182,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const normalizedSkills = normalizeSkillInput(params.skill);
 		const skills = normalizedSkills === false ? [] : normalizedSkills;
 		const maxSubagentDepth = resolveChildMaxSubagentDepth(currentMaxSubagentDepth, a.maxSubagentDepth);
-		const modelOverride = resolveModelCandidate((params.model as string | undefined) ?? a.model, availableModels, currentProvider);
+		const modelOverride = resolveSubagentModelOverride((params.model as string | undefined) ?? a.model, ctx.model, availableModels, currentProvider);
 		return executeAsyncSingle(id, {
 			agent: params.agent!,
 			task: params.context === "fork" ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
@@ -1281,6 +1284,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			cwd: ctx.cwd,
 			currentSessionId: deps.state.currentSessionId!,
 			currentModelProvider: ctx.model?.provider,
+			currentModel: ctx.model,
 		};
 		const asyncChain = wrapChainTasksForFork(chainResult.requestedAsync.chain, params.context);
 		return executeAsyncChain(id, {
@@ -1347,6 +1351,7 @@ interface ForegroundParallelRunInput {
 	artifactsDir: string;
 	maxOutput?: MaxOutputConfig;
 	paramsCwd: string;
+	progressDir: string;
 	maxSubagentDepths: number[];
 	availableModels: ModelInfo[];
 	modelOverrides: (string | undefined)[];
@@ -1464,6 +1469,11 @@ function findDuplicateParallelOutputPath(input: {
 }
 
 async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Promise<SingleResult[]> {
+	// Forked session creation touches the shared parent session. Resolve those
+	// branches sequentially before concurrent child dispatch so parallel workers
+	// cannot race the parent session manager and accidentally serialize/fail.
+	for (let index = 0; index < input.tasks.length; index++) input.sessionFileForIndex(index);
+
 	return mapConcurrent(input.tasks, input.concurrencyLimit, async (task, index) => {
 		const behavior = input.behaviors[index];
 		const effectiveSkills = behavior?.skills;
@@ -1472,7 +1482,7 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 			? buildChainInstructions({ ...behavior, output: false, progress: false }, taskCwd, false)
 			: { prefix: "", suffix: "" };
 		const progressInstructions = behavior
-			? buildChainInstructions({ ...behavior, output: false, reads: false }, input.paramsCwd, index === input.firstProgressIndex)
+			? buildChainInstructions({ ...behavior, output: false, reads: false }, input.progressDir, index === input.firstProgressIndex)
 			: { prefix: "", suffix: "" };
 		const outputPath = resolveSingleOutputPath(behavior?.output, input.ctx.cwd, taskCwd);
 		const taskText = injectSingleOutputInstruction(
@@ -1637,7 +1647,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		...(task.model ? { model: task.model } : {}),
 	}));
 	const modelOverrides: (string | undefined)[] = tasks.map((_, i) =>
-		resolveModelCandidate(behaviorOverrides[i]?.model ?? agentConfigs[i]?.model, availableModels, currentProvider),
+		resolveSubagentModelOverride(behaviorOverrides[i]?.model ?? agentConfigs[i]?.model, ctx.model, availableModels, currentProvider),
 	);
 
 	if (params.clarify === true && ctx.hasUI) {
@@ -1698,6 +1708,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				cwd: ctx.cwd,
 				currentSessionId: deps.state.currentSessionId!,
 				currentModelProvider: ctx.model?.provider,
+				currentModel: ctx.model,
 			};
 			const parallelTasks = tasks.map((t, i) => {
 				const taskText = params.context === "fork" ? wrapForkTask(taskTexts[i]!) : taskTexts[i]!;
@@ -1771,7 +1782,8 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 		}
 
 		const parallelProgressPrecreated = firstProgressIndex !== -1;
-		if (parallelProgressPrecreated) writeInitialProgressFile(effectiveCwd);
+		const parallelProgressDir = path.join(artifactsDir, "progress", runId);
+		if (parallelProgressPrecreated) writeInitialProgressFile(parallelProgressDir);
 
 		if (params.context === "fork") {
 			for (let i = 0; i < taskTexts.length; i++) {
@@ -1794,6 +1806,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			artifactsDir,
 			maxOutput: params.maxOutput,
 			paramsCwd: effectiveCwd,
+			progressDir: parallelProgressDir,
 			availableModels,
 			modelOverrides,
 			behaviors,
@@ -1920,8 +1933,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const currentProvider = ctx.model?.provider;
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	let task = params.task ?? "";
-	let modelOverride: string | undefined = resolveModelCandidate(
+	let modelOverride: string | undefined = resolveSubagentModelOverride(
 		(params.model as string | undefined) ?? agentConfig.model,
+		ctx.model,
 		availableModels,
 		currentProvider,
 	);
@@ -1978,6 +1992,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				cwd: ctx.cwd,
 				currentSessionId: deps.state.currentSessionId!,
 				currentModelProvider: ctx.model?.provider,
+				currentModel: ctx.model,
 			};
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
@@ -2174,6 +2189,23 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	};
 }
 
+function inferExecutionMode(params: SubagentParamsLike): SubagentRunMode {
+	if ((params.chain?.length ?? 0) > 0) return "chain";
+	if ((params.tasks?.length ?? 0) > 0) return "parallel";
+	return "single";
+}
+
+function duplicateSubagentCallResult(params: SubagentParamsLike): AgentToolResult<Details> {
+	return {
+		content: [{
+			type: "text",
+			text: "Rejected: a subagent call is already in progress. Issue exactly one subagent execution call at a time; use tasks/chain inside that call for intentional parallelism.",
+		}],
+		isError: true,
+		details: { mode: inferExecutionMode(params), results: [] },
+	};
+}
+
 export function createSubagentExecutor(deps: ExecutorDeps): {
 	execute: (
 		id: string,
@@ -2248,7 +2280,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					const foreground = getForegroundControl(deps.state, undefined);
 					if (foreground) return foregroundStatusResult(foreground);
 				}
-				return inspectSubagentStatus(paramsWithResolvedCwd, { state: deps.state, nested: nestedResolutionScopeForExecutor(deps) });
+				return inspectSubagentStatus(paramsWithResolvedCwd as Parameters<typeof inspectSubagentStatus>[0], { state: deps.state, nested: nestedResolutionScopeForExecutor(deps) });
 			}
 			if (params.action === "resume") {
 				return resumeAsyncRun({ params: paramsWithResolvedCwd, requestCwd, ctx, deps });
@@ -2304,7 +2336,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					details: { mode: "management" as const, results: [] },
 				};
 			}
-			return handleManagementAction(params.action, paramsWithResolvedCwd, { ...ctx, cwd: requestCwd });
+			return handleManagementAction(params.action, paramsWithResolvedCwd as Parameters<typeof handleManagementAction>[1], { ...ctx, cwd: requestCwd });
 		}
 
 		const { blocked, depth, maxDepth } = checkSubagentDepth(deps.config.maxSubagentDepth);
@@ -2448,6 +2480,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				updatedAt: Date.now(),
 				currentAgent: undefined,
 				currentIndex: undefined,
+				activeChildren: hasTasks
+					? Math.max(1, effectiveParams.tasks?.length ?? 1)
+					: hasChain && effectiveParams.chain?.[0] && isParallelStep(effectiveParams.chain[0] as ChainStep)
+						? Math.max(1, (effectiveParams.chain[0] as ParallelStep).parallel.length)
+						: 1,
 				currentActivityState: undefined,
 				nestedRoute,
 				interrupt: undefined,
@@ -2560,5 +2597,25 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}, effectiveParams.context);
 	};
 
-	return { execute };
+	const executeWithSingleDispatchGuard = async (
+		id: string,
+		params: SubagentParamsLike,
+		signal: AbortSignal,
+		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
+		ctx: ExtensionContext,
+	): Promise<AgentToolResult<Details>> => {
+		// Read/control management remains usable while a child is running. The
+		// guard only prevents multiple top-level execution calls from one Pi turn;
+		// intentional parallelism belongs inside a single tasks/chain request.
+		if (params.action) return execute(id, params, signal, onUpdate, ctx);
+		if (deps.state.subagentInProgress === true) return duplicateSubagentCallResult(params);
+		deps.state.subagentInProgress = true;
+		try {
+			return await execute(id, params, signal, onUpdate, ctx);
+		} finally {
+			deps.state.subagentInProgress = false;
+		}
+	};
+
+	return { execute: executeWithSingleDispatchGuard };
 }

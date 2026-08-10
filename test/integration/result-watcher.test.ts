@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { createResultWatcher } from "../../src/runs/background/result-watcher.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import type { SubagentState } from "../../src/shared/types.ts";
+import {
+	SUBAGENT_ASYNC_COMPLETE_EVENT,
+	SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT,
+	SUBAGENT_RESULT_INTERCOM_EVENT,
+	type SubagentState,
+} from "../../src/shared/types.ts";
 
 function createState(): SubagentState {
 	return {
@@ -65,6 +70,107 @@ describe("result watcher", () => {
 
 			assert.equal(emitted.filter((entry) => entry.event === "subagent:async-complete").length, 1);
 			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not deliver foreign or sessionless results from the same repository", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-owner-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = {
+				events: {
+					on: () => () => {},
+					emit(event: string, data: unknown) {
+						emitted.push({ event, data });
+					},
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-current";
+			const foreignPath = path.join(resultsDir, "foreign.json");
+			const sessionlessPath = path.join(resultsDir, "sessionless.json");
+			fs.writeFileSync(foreignPath, JSON.stringify({
+				id: "foreign",
+				sessionId: "session-other",
+				cwd: state.baseCwd,
+				success: true,
+				summary: "foreign",
+			}), "utf-8");
+			fs.writeFileSync(sessionlessPath, JSON.stringify({
+				id: "sessionless",
+				cwd: state.baseCwd,
+				success: true,
+				summary: "legacy",
+			}), "utf-8");
+
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			try {
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(emitted.length, 0);
+			assert.equal(fs.existsSync(foreignPath), true);
+			assert.equal(fs.existsSync(sessionlessPath), true);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("revokes an in-flight result callback when the watcher is stopped for reload", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-reload-"));
+		try {
+			const listeners = new Map<string, Set<(data: unknown) => void>>();
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const events = {
+				on(event: string, handler: (data: unknown) => void) {
+					const set = listeners.get(event) ?? new Set();
+					set.add(handler);
+					listeners.set(event, set);
+					return () => set.delete(handler);
+				},
+				emit(event: string, data: unknown) {
+					if (event === SUBAGENT_RESULT_INTERCOM_EVENT) {
+						const requestId = (data as { requestId?: string }).requestId;
+						setTimeout(() => {
+							for (const handler of listeners.get(SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT) ?? []) {
+								handler({ requestId, delivered: true });
+							}
+						}, 60);
+						return;
+					}
+					emitted.push({ event, data });
+					for (const handler of listeners.get(event) ?? []) handler(data);
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-before-reload";
+			const resultPath = path.join(resultsDir, "reload-race.json");
+			fs.writeFileSync(resultPath, JSON.stringify({
+				id: "reload-race",
+				runId: "reload-race",
+				sessionId: "session-before-reload",
+				intercomTarget: "subagent-worker-reload-race-1",
+				agent: "worker",
+				success: true,
+				summary: "done",
+			}), "utf-8");
+
+			const watcher = createResultWatcher({ events } as never, state, resultsDir, 60_000);
+			watcher.startResultWatcher();
+			watcher.primeExistingResults();
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			watcher.stopResultWatcher();
+			state.currentSessionId = "session-after-reload";
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			assert.equal(emitted.some((entry) => entry.event === SUBAGENT_ASYNC_COMPLETE_EVENT), false);
+			assert.equal(fs.existsSync(resultPath), true, "stale watcher must leave the result for the owning session to recover");
+			assert.equal(state.completionSeen.size, 0, "stale watcher must not commit delivery dedupe state");
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}

@@ -117,6 +117,29 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("ignores async lifecycle events owned by another Pi session", () => {
+		const asyncRoot = createTempDir("pi-async-job-owner-");
+		try {
+			const state = createState();
+			state.currentSessionId = "session-a";
+			const recorder = createEventRecorder();
+			const tracker = trackerMod!.createAsyncJobTracker(recorder.pi, state as never, asyncRoot);
+
+			tracker.handleStarted({ id: "foreign", sessionId: "session-b", agent: "worker" });
+			assert.equal(state.asyncJobs.size, 0);
+
+			state.asyncJobs.set("local", {
+				asyncId: "local",
+				asyncDir: path.join(asyncRoot, "local"),
+				status: "running",
+			} as never);
+			tracker.handleComplete({ id: "local", sessionId: "session-b", success: true });
+			assert.equal((state.asyncJobs.get("local") as { status: string }).status, "running");
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
 	it("uses flattened async-start agents for initial parallel group widget state", () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-");
 		try {

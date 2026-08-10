@@ -4,6 +4,7 @@ import {
 	buildModelCandidates,
 	isRetryableModelFailure,
 	resolveModelCandidate,
+	resolveSubagentModelOverride,
 } from "../../src/runs/shared/model-fallback.ts";
 
 describe("model fallback helpers", () => {
@@ -11,6 +12,14 @@ describe("model fallback helpers", () => {
 		{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
 		{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
 	];
+
+	it("inherits the parent session model when no explicit model is requested", () => {
+		const parent = { provider: "openai-codex", id: "gpt-5.6-luna" };
+		assert.equal(resolveSubagentModelOverride(undefined, parent, availableModels), "openai-codex/gpt-5.6-luna");
+		assert.equal(resolveSubagentModelOverride(false, parent, availableModels), "openai-codex/gpt-5.6-luna");
+		assert.equal(resolveSubagentModelOverride("inherit", parent, availableModels), "openai-codex/gpt-5.6-luna");
+		assert.equal(resolveSubagentModelOverride("  ", parent, availableModels), "openai-codex/gpt-5.6-luna");
+	});
 
 	it("keeps explicit provider/model ids unchanged", () => {
 		assert.equal(resolveModelCandidate("openai/gpt-5-mini", availableModels), "openai/gpt-5-mini");
@@ -66,6 +75,7 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("rate limit exceeded for provider"), true);
 		assert.equal(isRetryableModelFailure("model unavailable"), true);
 		assert.equal(isRetryableModelFailure("authentication failed"), true);
+		assert.equal(isRetryableModelFailure("Subagent produced no output (possible model cold-start or empty response)."), true);
 	});
 
 	it("does not treat ordinary task/tool failures as retryable model failures", () => {

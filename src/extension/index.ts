@@ -6,10 +6,10 @@
  * - Async: Background execution, emits events when done
  *
  * Modes: single (agent + task), parallel (tasks[]), chain (chain[] with {previous})
- * Toggle: async parameter (default: false, configurable via config.json)
+ * Toggle: async parameter (default: false, configurable via user settings)
  *
- * Config file: ~/.pi/agent/extensions/subagent/config.json
- *   { "asyncByDefault": true, "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
+ * Runtime config: ~/.pi/agent/settings.json -> subagents.runtime
+ * Legacy ~/.pi/agent/extensions/subagent/config.json is read only as a migration fallback.
  */
 
 import * as fs from "node:fs";
@@ -33,10 +33,11 @@ import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import registerFanoutChildSubagentExtension from "./fanout-child.ts";
+import { SUBAGENT_CHILD_ENV } from "../runs/shared/pi-args.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { loadConfig } from "./config.ts";
+import { registerCockpitFooter } from "../ui/footer.ts";
+import { registerFileTracker } from "../ui/file-tracker.ts";
 import {
 	type Details,
 	type SubagentState,
@@ -208,10 +209,10 @@ class SubagentControlNoticeComponent implements Component {
 }
 
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
-	if (process.env[SUBAGENT_CHILD_ENV] === "1") {
-		if (process.env[SUBAGENT_FANOUT_CHILD_ENV] === "1") registerFanoutChildSubagentExtension(pi);
-		return;
-	}
+	// Child-safe fanout is loaded explicitly by buildPiArgs(). The package
+	// entrypoint must remain inert in every child or Pi will register the same
+	// `subagent` tool twice when both extensions are discovered.
+	if (process.env[SUBAGENT_CHILD_ENV] === "1") return;
 	const globalStore = globalThis as Record<string, unknown>;
 	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
 	const previousRuntimeCleanup = globalStore[runtimeCleanupStoreKey];
@@ -235,6 +236,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const state: SubagentState = {
 		baseCwd: "",
 		currentSessionId: null,
+		subagentInProgress: false,
 		asyncJobs: new Map(),
 		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
@@ -252,6 +254,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 	};
 
+	const fileTracker = registerFileTracker(pi);
+	const disposeCockpit = registerCockpitFooter(pi, state, fileTracker);
+
 	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(
 		pi,
 		state,
@@ -262,6 +267,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	primeExistingResults();
 
 	const runtimeCleanup = () => {
+		disposeCockpit();
 		stopResultWatcher();
 		clearPendingForegroundControlNotices(state);
 		if (state.poller) {
@@ -326,9 +332,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		return new SubagentControlNoticeComponent({ ...details, noticeText: formatSubagentControlNotice(details, content) }, theme);
 	});
 
-	const executeSubagentCollapsed = (id: string, params: SubagentParamsLike, signal: AbortSignal, onUpdate: ((result: AgentToolResult<Details>) => void) | undefined, ctx: ExtensionContext) => {
+	const executeSubagentCollapsed = (id: string, params: SubagentParamsLike, signal: AbortSignal | undefined, onUpdate: ((result: AgentToolResult<Details>) => void) | undefined, ctx: ExtensionContext) => {
 		if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
-		return executor.execute(id, params, signal, onUpdate, ctx);
+		return executor.execute(id, params, signal ?? new AbortController().signal, onUpdate, ctx);
 	};
 
 	const slashBridge = registerSlashSubagentBridge({
@@ -421,7 +427,7 @@ DIAGNOSTICS:
 		parameters: SubagentParams,
 
 		execute(id, params, signal, onUpdate, ctx) {
-			return executeSubagentCollapsed(id, params, signal, onUpdate, ctx);
+			return executeSubagentCollapsed(id, params as SubagentParamsLike, signal, onUpdate, ctx);
 		},
 
 		renderCall(args, theme) {
@@ -477,7 +483,7 @@ DIAGNOSTICS:
 			}
 		}
 	}
-	registerSubagentNotify(pi);
+	registerSubagentNotify(pi, state);
 
 	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
 	const visibleControlNotices = existingVisibleControlNotices instanceof Set ? existingVisibleControlNotices as Set<string> : new Set<string>();
@@ -503,7 +509,7 @@ DIAGNOSTICS:
 		state.lastUiContext = ctx;
 		if (state.asyncJobs.size > 0) {
 			renderWidget(ctx, Array.from(state.asyncJobs.values()));
-			ctx.ui.requestRender?.();
+			(ctx.ui as { requestRender?: () => void }).requestRender?.();
 			ensurePoller();
 		}
 	});
