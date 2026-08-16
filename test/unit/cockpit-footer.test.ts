@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { activeSubagentCount, buildContextBar, truncateFooterLine } from "../../src/ui/footer.ts";
+import { activeSubagentCount, buildCockpitFooterParts, buildContextBar, composeExtensionStatuses, truncateFooterLine } from "../../src/ui/footer.ts";
 import { parseDiffCounts } from "../../src/ui/file-tracker.ts";
 
 test("buildContextBar clamps and renders ten cells", () => {
@@ -16,6 +16,63 @@ test("truncateFooterLine preserves ANSI integrity at narrow widths", () => {
 	const truncated = truncateFooterLine(line, 14);
 	assert.ok(visibleWidth(truncated) <= 14);
 	assert.doesNotMatch(truncated, /\u001b\[[0-9;]*$/);
+});
+
+test("composeExtensionStatuses sorts by key, sanitizes, and drops empties", () => {
+	const statuses = new Map<string, string>([
+		["token-speed", "⚡ TPS: 42.3 tok/s\u200b"],
+		["notes", "line 1\nline 2\twith\ttabs"],
+		["blank", "   "],
+	]);
+	assert.equal(
+		composeExtensionStatuses(statuses),
+		"line 1 line 2 with tabs ⚡ TPS: 42.3 tok/s\u200b",
+	);
+	assert.equal(composeExtensionStatuses(new Map()), "");
+});
+
+test("composed cockpit footer truncates a pi-token-speed payload with ANSI closed at the cut", () => {
+	const payload = `${"\u001b[2m⚡ TPS:\u001b[0m"} ${"\u001b[38;2;255;165;0m"}42.3 tok/s\u001b[0m\u200b`;
+	const line = [
+		"openai-codex · GPT-5.6 Luna",
+		"3 files +84 -12",
+		composeExtensionStatuses(new Map([["tokenSpeed", payload]])),
+	].join(" │ ");
+
+	const truncated = truncateFooterLine(line, 60);
+
+	assert.ok(visibleWidth(truncated) <= 60);
+	assert.doesNotMatch(truncated, /\u001b\[[0-9;]*$/);
+	assert.match(truncated, /\u001b\[38;2;/);
+	assert.ok(truncated.includes("42"));
+	const ansiCodes = truncated.match(/\u001b\[[0-9;]*m/g) ?? [];
+	assert.match(ansiCodes[ansiCodes.length - 1]!, /\u001b\[0m$/);
+});
+
+test("cockpit footer parts re-read the extension-status channel every frame", () => {
+	const theme = { fg: (_color: string, text: string) => text };
+	const statuses = new Map<string, string>();
+	const footerData = { getExtensionStatuses: () => statuses };
+	const info = {
+		model: null,
+		branch: "",
+		stats: { fileCount: 0, insertions: 0, deletions: 0 },
+		contextUsage: null,
+		subagents: 0,
+	};
+
+	assert.equal(buildCockpitFooterParts(info, theme, footerData).join(" │ "), "– · – │ ⎇ – │ 0 files");
+
+	statuses.set("tokenSpeed", `${"\u001b[2m⚡ TPS:\u001b[0m"} --\u200b`);
+	assert.equal(
+		buildCockpitFooterParts(info, theme, footerData).join(" │ "),
+		`– · – │ ⎇ – │ 0 files │ ${"\u001b[2m⚡ TPS:\u001b[0m"} --\u200b`,
+	);
+
+	statuses.set("tokenSpeed", `${"\u001b[2m⚡ TPS:\u001b[0m"} ${"\u001b[38;2;255;165;0m"}42.3 tok/s\u001b[0m\u200b`);
+	const updated = buildCockpitFooterParts(info, theme, footerData).join(" │ ");
+	assert.ok(updated.includes("42.3 tok/s"));
+	assert.match(updated, /\u001b\[38;2;255;165;0m/);
 });
 
 test("parseDiffCounts ignores diff headers", () => {

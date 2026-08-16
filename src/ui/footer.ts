@@ -61,6 +61,64 @@ export function truncateFooterLine(line: string, width: number): string {
 	return truncateToWidth(line, Math.max(0, width), "");
 }
 
+function sanitizeStatusText(text: string): string {
+	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
+}
+
+export function composeExtensionStatuses(statuses: ReadonlyMap<string, string>): string {
+	if (statuses.size === 0) return "";
+	return Array.from(statuses.entries())
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([, text]) => sanitizeStatusText(text))
+		.filter((text) => text.length > 0)
+		.join(" ");
+}
+
+export interface CockpitFooterRenderInfo {
+	model: { provider: string; name?: string; id?: string } | null;
+	branch: string;
+	stats: { fileCount: number; insertions: number; deletions: number };
+	contextUsage: { percent?: number | null } | null;
+	subagents: number;
+}
+
+export function buildCockpitFooterParts(
+	info: CockpitFooterRenderInfo,
+	theme: { fg(color: string, text: string): string },
+	footerData: { getExtensionStatuses(): ReadonlyMap<string, string> },
+): string[] {
+	const parts: string[] = [];
+
+	if (info.model) {
+		const friendlyName = info.model.name ?? info.model.id;
+		parts.push(`${info.model.provider} · ${friendlyName}`);
+	} else {
+		parts.push("– · –");
+	}
+
+	parts.push(`⎇ ${info.branch || "–"}`);
+
+	if (info.stats.fileCount > 0) {
+		parts.push(
+			`${info.stats.fileCount} files ${theme.fg("success", `+${info.stats.insertions}`)} ${theme.fg("error", `-${info.stats.deletions}`)}`,
+		);
+	} else {
+		parts.push("0 files");
+	}
+
+	if (info.contextUsage) {
+		const percent = info.contextUsage.percent ?? 0;
+		parts.push(theme.fg(usageColor(percent), `${buildContextBar(percent)} ${percent.toFixed(1)}%`));
+	}
+
+	if (info.subagents > 0) parts.push(theme.fg("accent", `SUB ${info.subagents}`));
+
+	const statusLine = composeExtensionStatuses(footerData.getExtensionStatuses());
+	if (statusLine) parts.push(statusLine);
+
+	return parts;
+}
+
 export function registerCockpitFooter(pi: ExtensionAPI, state: SubagentState, fileTracker: FileTracker): () => void {
 	let tui: { requestRender(): void } | null = null;
 	let currentModel: any = null;
@@ -89,35 +147,17 @@ export function registerCockpitFooter(pi: ExtensionAPI, state: SubagentState, fi
 
 			return {
 				render(width: number): string[] {
-					const parts: string[] = [];
-
-					if (currentModel) {
-						const friendlyName = currentModel.name ?? currentModel.id;
-						parts.push(`${currentModel.provider} · ${friendlyName}`);
-					} else {
-						parts.push("– · –");
-					}
-
-					parts.push(`⎇ ${cachedBranch || "–"}`);
-
-					const stats = fileTracker.getStats();
-					if (stats.fileCount > 0) {
-						parts.push(
-							`${stats.fileCount} files ${theme.fg("success", `+${stats.insertions}`)} ${theme.fg("error", `-${stats.deletions}`)}`,
-						);
-					} else {
-						parts.push("0 files");
-					}
-
-					const contextUsage = ctx.getContextUsage();
-					if (contextUsage) {
-						const percent = contextUsage.percent ?? 0;
-						parts.push(theme.fg(usageColor(percent), `${buildContextBar(percent)} ${percent.toFixed(1)}%`));
-					}
-
-					const subagents = activeSubagentCount(state);
-					if (subagents > 0) parts.push(theme.fg("accent", `SUB ${subagents}`));
-
+					const parts = buildCockpitFooterParts(
+						{
+							model: currentModel,
+							branch: cachedBranch,
+							stats: fileTracker.getStats(),
+							contextUsage: ctx.getContextUsage(),
+							subagents: activeSubagentCount(state),
+						},
+						theme,
+						footerData,
+					);
 					return [truncateFooterLine(parts.join(" │ "), width)];
 				},
 				invalidate() {},
